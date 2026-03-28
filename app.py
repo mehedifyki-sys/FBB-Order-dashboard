@@ -167,7 +167,7 @@ def load_data():
 
     return df, orders, weekly_status
 
-st.markdown("<div class='main-title'>FBB Order Command Center</div>", unsafe_allow_html=True)
+st.markdown(     "<div class='main-title' style='margin-left: 10px;'>FBB Order Command Center</div>",     unsafe_allow_html=True )
 st.markdown("<div class='sub-title'>Centralized database view. Only admin updates data.</div>", unsafe_allow_html=True)
 
 df, orders, weekly_status = load_data()

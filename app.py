@@ -23,27 +23,24 @@ st.set_page_config(
 # =========================================================
 st.markdown("""
 <style>
-/* -------- Main layout spacing -------- */
 .block-container {
-    padding-top: 2.6rem !important;
+    padding-top: 2.8rem !important;
     padding-bottom: 2rem !important;
     padding-left: 2rem !important;
     padding-right: 2rem !important;
 }
 
-/* prevent title/header cutting */
 h1, h2, h3 {
-    padding-top: 0.2rem !important;
+    padding-top: 0.15rem !important;
     margin-top: 0 !important;
 }
 
-/* -------- Custom components -------- */
 .page-title {
-    font-size: 2.1rem;
+    font-size: 2.15rem;
     font-weight: 800;
-    margin-bottom: 0.4rem;
+    margin-bottom: 0.35rem;
     line-height: 1.25;
-    padding-top: 0.2rem;
+    padding-top: 0.1rem;
 }
 
 .page-subtitle {
@@ -60,7 +57,7 @@ h1, h2, h3 {
     min-height: 138px;
     display: flex;
     flex-direction: column;
-    justify-content: space-between;
+    justify-content: center;
 }
 
 .metric-card {
@@ -69,13 +66,6 @@ h1, h2, h3 {
     padding: 14px 16px;
     background: rgba(255,255,255,0.03);
     min-height: 92px;
-}
-
-.section-box {
-    border: 1px solid rgba(140, 140, 140, 0.18);
-    border-radius: 18px;
-    padding: 18px;
-    background: rgba(255,255,255,0.02);
 }
 
 .small-muted {
@@ -139,7 +129,7 @@ DATASETS = {
 
 
 # =========================================================
-# BASIC HELPERS
+# HELPERS
 # =========================================================
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
@@ -190,7 +180,7 @@ def normalize_value_for_json(value):
     return value
 
 
-def batched(seq, size=500):
+def batched(seq, size=200):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
@@ -214,16 +204,13 @@ def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
     return output.getvalue()
 
 
-# =========================================================
-# CACHE CLEAR
-# =========================================================
 def clear_caches():
     load_active_upload_meta.clear()
     load_dataset_df.clear()
 
 
 # =========================================================
-# DATABASE READ HELPERS
+# DATABASE READ
 # =========================================================
 @st.cache_data(ttl=30)
 def load_active_upload_meta(dataset_key: str):
@@ -271,21 +258,21 @@ def load_dataset_df(dataset_key: str):
 
     all_rows = []
     page_size = 1000
-    start = 0
+    last_row_number = 0
 
-    while start < total_count:
-        end = min(start + page_size - 1, total_count - 1)
+    while True:
         try:
             resp = (
                 sb.table(cfg["rows_table"])
                 .select("row_number,row_data")
                 .eq("upload_id", upload_id)
+                .gt("row_number", last_row_number)
                 .order("row_number")
-                .range(start, end)
+                .limit(page_size)
                 .execute()
             )
         except Exception as e:
-            st.error(f"Row page load error ({start}-{end}): {e}")
+            st.error(f"Row page load error after row {last_row_number}: {e}")
             break
 
         batch = resp.data or []
@@ -293,7 +280,10 @@ def load_dataset_df(dataset_key: str):
             break
 
         all_rows.extend(batch)
-        start += page_size
+        last_row_number = batch[-1]["row_number"]
+
+        if len(all_rows) >= total_count:
+            break
 
     records = [r["row_data"] for r in all_rows]
     df = pd.DataFrame(records)
@@ -311,7 +301,7 @@ def load_dataset_df(dataset_key: str):
 
 
 # =========================================================
-# DATABASE WRITE HELPERS
+# DATABASE WRITE
 # =========================================================
 def set_old_uploads_inactive(sb: Client, dataset_key: str, new_upload_id: int):
     existing = (
@@ -367,7 +357,7 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         upload_id = upload_resp.data[0]["id"]
 
         records = dataframe_to_records(df)
-        for chunk in batched(records, 500):
+        for chunk in batched(records, 200):
             payload = [
                 {
                     "upload_id": upload_id,
@@ -608,9 +598,11 @@ def page_order_dashboard():
 
     df, upload_meta = load_dataset_df("order_dashboard")
 
-    # Debug line to confirm full load
     if upload_meta:
-        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {int(upload_meta.get('row_count', 0)):,}")
+        expected_rows = int(upload_meta.get("row_count", 0))
+        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {expected_rows:,}")
+        if len(df) != expected_rows:
+            st.error("Dataset load mismatch detected. Some rows are not being read from Supabase correctly.")
 
     render_last_updated(upload_meta)
     st.markdown("<br>", unsafe_allow_html=True)
@@ -713,8 +705,12 @@ def page_fbb_shipment_details():
     render_page_header("FBB-Shipment Details", "Shipment summary, weekly shipped quantity and tracking visibility.")
 
     df, upload_meta = load_dataset_df("fbb_shipment_details")
+
     if upload_meta:
-        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {int(upload_meta.get('row_count', 0)):,}")
+        expected_rows = int(upload_meta.get("row_count", 0))
+        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {expected_rows:,}")
+        if len(df) != expected_rows:
+            st.error("Dataset load mismatch detected. Some rows are not being read from Supabase correctly.")
 
     render_last_updated(upload_meta)
     st.markdown("<br>", unsafe_allow_html=True)
@@ -783,8 +779,12 @@ def page_fbb_invoice_status():
     render_page_header("FBB Invoice Status", "Invoice progress, remaining quantity and team/status analysis.")
 
     df, upload_meta = load_dataset_df("fbb_invoice_status")
+
     if upload_meta:
-        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {int(upload_meta.get('row_count', 0)):,}")
+        expected_rows = int(upload_meta.get("row_count", 0))
+        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {expected_rows:,}")
+        if len(df) != expected_rows:
+            st.error("Dataset load mismatch detected. Some rows are not being read from Supabase correctly.")
 
     render_last_updated(upload_meta)
     st.markdown("<br>", unsafe_allow_html=True)

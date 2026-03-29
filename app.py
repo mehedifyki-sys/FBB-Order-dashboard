@@ -125,7 +125,7 @@ DATASETS = {
         "cleanup_tables": [
             "dataset_export_chunks",
             "dataset_metrics",
-            "shipment_weekly_summary",
+            "shipment_month_summary",
             "shipment_ref_summary",
         ],
     },
@@ -193,10 +193,8 @@ def normalize_date_like_text(value: Any):
 
     if isinstance(value, str):
         text = value.strip()
-
         if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
             return text
-
         if re.match(r"^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(\.\d+)?$", text):
             return text[:10]
 
@@ -206,27 +204,21 @@ def normalize_date_like_text(value: Any):
 def normalize_value_for_json(value: Any):
     if pd.isna(value):
         return None
-
     if isinstance(value, pd.Timestamp):
         return value.strftime("%Y-%m-%d")
-
     if isinstance(value, str):
         return normalize_date_like_text(value)
-
     return value
 
 
 def safe_text(value: Any):
     if pd.isna(value):
         return None
-
     if isinstance(value, pd.Timestamp):
         return value.strftime("%Y-%m-%d")
-
     if isinstance(value, str):
         value = normalize_date_like_text(value)
         return None if value is None else str(value)
-
     return str(value)
 
 
@@ -550,12 +542,18 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
 def build_shipment_data(df: pd.DataFrame, upload_id: int):
     order_col = first_existing_column(df, ["ORDER #"])
     qty_col = first_existing_column(df, ["Order qty"])
-    week_col = first_existing_column(df, ["WEEK"])
     ship_ref_col = first_existing_column(df, ["Shipment Ref#"])
+    ship_out_col = first_existing_column(df, ["Ship out date", "Ship Out Date"])
 
     work = df.copy()
     if qty_col:
         work[qty_col] = parse_numeric_series(work[qty_col])
+
+    if ship_out_col:
+        work["_ship_out_dt"] = pd.to_datetime(work[ship_out_col], errors="coerce")
+        work["_ship_month"] = work["_ship_out_dt"].dt.strftime("%Y-%m")
+    else:
+        work["_ship_month"] = None
 
     if ship_ref_col:
         shipment_ref_series = work[ship_ref_col].astype(str).str.strip()
@@ -569,68 +567,71 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
     total_shipped_orders = shipped_df[order_col].nunique() if order_col and not shipped_df.empty else 0
     total_qty_shipped = shipped_df[qty_col].sum() if qty_col and not shipped_df.empty else 0
 
+    latest_month_qty = 0
+    latest_month_text = None
+    if "_ship_month" in shipped_df.columns and not shipped_df.empty:
+        valid_months = shipped_df["_ship_month"].dropna().astype(str)
+        if not valid_months.empty:
+            latest_month_text = sorted(valid_months.unique())[-1]
+            latest_month_qty = shipped_df.loc[shipped_df["_ship_month"] == latest_month_text, qty_col].sum() if qty_col else 0
+
     metrics_rows = [
         {"upload_id": upload_id, "metric_key": "total_rows", "metric_num": total_rows, "metric_text": None},
         {"upload_id": upload_id, "metric_key": "total_shipment_refs_bd", "metric_num": total_shipment_refs, "metric_text": None},
         {"upload_id": upload_id, "metric_key": "total_shipped_orders_bd", "metric_num": total_shipped_orders, "metric_text": None},
         {"upload_id": upload_id, "metric_key": "total_qty_shipped_bd", "metric_num": float(total_qty_shipped) if pd.notna(total_qty_shipped) else 0, "metric_text": None},
+        {"upload_id": upload_id, "metric_key": "latest_month_qty_shipped", "metric_num": float(latest_month_qty) if pd.notna(latest_month_qty) else 0, "metric_text": None},
+        {"upload_id": upload_id, "metric_key": "latest_ship_month", "metric_num": None, "metric_text": latest_month_text},
     ]
 
-    weekly_rows = []
-    if week_col and qty_col and not shipped_df.empty:
-        weekly = (
-            shipped_df.groupby(week_col, dropna=False)[qty_col]
-            .sum(min_count=1)
-            .reset_index(name="total_order_qty")
+    month_rows = []
+    if qty_col and not shipped_df.empty:
+        month_summary = (
+            shipped_df.groupby("_ship_month", dropna=False)
+            .agg(
+                shipment_ref_count=(ship_ref_col, "nunique") if ship_ref_col else ("_ship_month", "count"),
+                unique_orders=(order_col, "nunique") if order_col else ("_ship_month", "count"),
+                total_qty_shipped=(qty_col, "sum")
+            )
+            .reset_index()
+            .rename(columns={"_ship_month": "ship_month"})
         )
-        weekly = sort_week_dataframe(weekly, week_col)
 
-        for _, row in weekly.iterrows():
-            weekly_rows.append({
+        month_summary = month_summary.sort_values("ship_month", na_position="last")
+
+        for _, row in month_summary.iterrows():
+            month_rows.append({
                 "upload_id": upload_id,
-                "week_value": safe_text(row[week_col]),
-                "total_order_qty": safe_num(row["total_order_qty"]),
+                "ship_month": safe_text(row["ship_month"]),
+                "shipment_ref_count": int(row["shipment_ref_count"]) if pd.notna(row["shipment_ref_count"]) else 0,
+                "unique_orders": int(row["unique_orders"]) if pd.notna(row["unique_orders"]) else 0,
+                "total_qty_shipped": safe_num(row["total_qty_shipped"]),
             })
 
     ref_summary_rows = []
     if ship_ref_col and not shipped_df.empty:
-        if order_col and qty_col:
-            ref_summary = (
-                shipped_df.groupby(ship_ref_col, dropna=False)
-                .agg(unique_orders=(order_col, "nunique"), total_qty_shipped=(qty_col, "sum"))
-                .reset_index()
+        ref_summary = (
+            shipped_df.groupby(["_ship_month", ship_ref_col], dropna=False)
+            .agg(
+                unique_orders=(order_col, "nunique") if order_col else (ship_ref_col, "count"),
+                total_qty_shipped=(qty_col, "sum") if qty_col else (ship_ref_col, "count")
             )
-        elif order_col:
-            ref_summary = (
-                shipped_df.groupby(ship_ref_col, dropna=False)
-                .agg(unique_orders=(order_col, "nunique"))
-                .reset_index()
-            )
-            ref_summary["total_qty_shipped"] = None
-        elif qty_col:
-            ref_summary = (
-                shipped_df.groupby(ship_ref_col, dropna=False)
-                .agg(total_qty_shipped=(qty_col, "sum"))
-                .reset_index()
-            )
-            ref_summary["unique_orders"] = None
-        else:
-            ref_summary = (
-                shipped_df.groupby(ship_ref_col, dropna=False)
-                .size()
-                .reset_index(name="unique_orders")
-            )
-            ref_summary["total_qty_shipped"] = None
+            .reset_index()
+            .rename(columns={"_ship_month": "ship_month"})
+        )
+
+        ref_summary = ref_summary.sort_values(["ship_month", ship_ref_col], na_position="last")
 
         for _, row in ref_summary.iterrows():
             ref_summary_rows.append({
                 "upload_id": upload_id,
+                "ship_month": safe_text(row["ship_month"]),
                 "shipment_ref": safe_text(row[ship_ref_col]),
                 "unique_orders": int(row["unique_orders"]) if pd.notna(row["unique_orders"]) else 0,
                 "total_qty_shipped": safe_num(row["total_qty_shipped"]),
             })
 
-    return metrics_rows, weekly_rows, ref_summary_rows
+    return metrics_rows, month_rows, ref_summary_rows
 
 
 def build_invoice_data(df: pd.DataFrame, upload_id: int):
@@ -784,9 +785,9 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
 
         elif dataset_key == "fbb_shipment_details":
             progress.progress(45, text="Building shipment dashboard...")
-            metrics_rows, weekly_rows, ref_summary_rows = build_shipment_data(df, upload_id)
+            metrics_rows, month_rows, ref_summary_rows = build_shipment_data(df, upload_id)
             insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
-            insert_in_chunks("shipment_weekly_summary", weekly_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("shipment_month_summary", month_rows, DB_INSERT_CHUNK)
             insert_in_chunks("shipment_ref_summary", ref_summary_rows, DB_INSERT_CHUNK)
 
         elif dataset_key == "fbb_invoice_status":
@@ -1033,7 +1034,7 @@ def home_page():
         <div class="card">
             <div>
                 <h3 style="margin-bottom:10px;">FBB-Shipment Details</h3>
-                <p style="margin:0;">Shipment overview by Shipment Ref# and week.</p>
+                <p style="margin:0;">Shipment overview by Shipment Ref# and month.</p>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1121,7 +1122,7 @@ def page_order_dashboard():
 
 
 def page_fbb_shipment_details():
-    render_page_header("FBB-Shipment Details", "Shipment overview by BD Shipment Ref#.")
+    render_page_header("FBB-Shipment Details", "Shipment overview by BD Shipment Ref# and Ship out date month.")
 
     upload_meta = load_active_upload_meta("fbb_shipment_details")
     render_last_updated(upload_meta)
@@ -1138,36 +1139,67 @@ def page_fbb_shipment_details():
     upload_id = int(upload_meta["id"])
     metrics = load_metrics_map(upload_id)
 
+    latest_month_label = metrics.get("latest_ship_month") or "-"
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Rows", f"{int(metrics.get('total_rows', 0)):,}")
-    c2.metric("BD Shipment Refs", f"{int(metrics.get('total_shipment_refs_bd', 0)):,}")
-    c3.metric("Unique Shipped Orders", f"{int(metrics.get('total_shipped_orders_bd', 0)):,}")
-    c4.metric("Total Qty Shipped", f"{float(metrics.get('total_qty_shipped_bd', 0)):,.0f}")
+    c1.metric("Total Shipment Ref#", f"{int(metrics.get('total_shipment_refs_bd', 0)):,}")
+    c2.metric("Unique Shipped Orders", f"{int(metrics.get('total_shipped_orders_bd', 0)):,}")
+    c3.metric("Total Qty Shipped", f"{float(metrics.get('total_qty_shipped_bd', 0)):,.0f}")
+    c4.metric(f"Latest Month Qty ({latest_month_label})", f"{float(metrics.get('latest_month_qty_shipped', 0)):,.0f}")
 
-    weekly_rows = load_table_records("shipment_weekly_summary", upload_id)
-    if weekly_rows:
-        weekly_df = pd.DataFrame(weekly_rows)[["week_value", "total_order_qty"]]
-        weekly_df = sort_week_dataframe(weekly_df, "week_value")
+    month_rows = load_table_records("shipment_month_summary", upload_id)
+    if month_rows:
+        month_df = pd.DataFrame(month_rows)[["ship_month", "shipment_ref_count", "unique_orders", "total_qty_shipped"]]
+        month_df = month_df.sort_values("ship_month", na_position="last")
 
-        st.subheader("Qty Shipped by Week")
-        fig = px.bar(weekly_df, x="week_value", y="total_order_qty", hover_data=weekly_df.columns)
+        st.subheader("Month-wise Qty Shipped")
+        fig = px.bar(month_df, x="ship_month", y="total_qty_shipped", hover_data=month_df.columns)
         st.plotly_chart(fig, use_container_width=True)
+
+        available_months = [m for m in month_df["ship_month"].dropna().astype(str).tolist()]
+    else:
+        month_df = pd.DataFrame(columns=["ship_month", "shipment_ref_count", "unique_orders", "total_qty_shipped"])
+        available_months = []
 
     ref_rows = load_table_records("shipment_ref_summary", upload_id)
     if ref_rows:
-        ref_df = pd.DataFrame(ref_rows)[["shipment_ref", "unique_orders", "total_qty_shipped"]]
+        ref_df = pd.DataFrame(ref_rows)[["ship_month", "shipment_ref", "unique_orders", "total_qty_shipped"]]
+        ref_df = ref_df.sort_values(["ship_month", "shipment_ref"], na_position="last")
 
-        st.subheader("Shipment Reference Overview")
+        control_col1, control_col2 = st.columns(2)
+        with control_col1:
+            if available_months:
+                selected_month = st.selectbox(
+                    "Select Month",
+                    options=available_months,
+                    index=max(len(available_months) - 1, 0),
+                    key="shipment_month_filter"
+                )
+            else:
+                selected_month = None
+
+        with control_col2:
+            top_n = st.selectbox("Top Shipment Ref#", options=[10, 20, 30, 50], index=1, key="shipment_top_n")
+
+        filtered_ref_df = ref_df.copy()
+        if selected_month:
+            filtered_ref_df = filtered_ref_df[filtered_ref_df["ship_month"].astype(str) == str(selected_month)]
+
+        st.subheader("Shipment Ref# for Selected Month")
         search_text = st.text_input("Search Shipment Ref#", key="search_shipment_ref")
-        ref_df = search_dataframe(ref_df, search_text)
+        filtered_ref_df = search_dataframe(filtered_ref_df, search_text)
 
-        chart_df = ref_df.head(TOP_SHIPMENT_REF_CHART_ROWS).copy()
+        chart_df = filtered_ref_df.sort_values("total_qty_shipped", ascending=False).head(top_n).copy()
         if not chart_df.empty:
-            st.subheader("Top Shipment References by Qty Shipped")
-            fig = px.bar(chart_df, x="shipment_ref", y="total_qty_shipped", hover_data=chart_df.columns)
+            fig = px.bar(
+                chart_df,
+                x="shipment_ref",
+                y="total_qty_shipped",
+                hover_data=["ship_month", "unique_orders", "total_qty_shipped"]
+            )
             st.plotly_chart(fig, use_container_width=True)
 
-        st.dataframe(ref_df, use_container_width=True, height=420)
+        st.dataframe(filtered_ref_df, use_container_width=True, height=420)
     else:
         st.info("No BD shipment references found.")
 

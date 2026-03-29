@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 
@@ -73,6 +74,13 @@ h1, h2, h3 {
     font-size: 1.75rem;
     font-weight: 750;
     line-height: 1.2;
+}
+.big-number-small {
+    font-size: 1.05rem;
+    font-weight: 750;
+    line-height: 1.2;
+    white-space: normal;
+    word-break: break-word;
 }
 div[data-testid="stMetric"] {
     background: rgba(255,255,255,0.02);
@@ -176,19 +184,49 @@ def parse_numeric_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
+def normalize_date_like_text(value: Any):
+    if value is None:
+        return None
+
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, str):
+        text = value.strip()
+
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+            return text
+
+        if re.match(r"^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}:\d{2}(\.\d+)?$", text):
+            return text[:10]
+
+    return value
+
+
 def normalize_value_for_json(value: Any):
     if pd.isna(value):
         return None
+
     if isinstance(value, pd.Timestamp):
         return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, str):
+        return normalize_date_like_text(value)
+
     return value
 
 
 def safe_text(value: Any):
     if pd.isna(value):
         return None
+
     if isinstance(value, pd.Timestamp):
         return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, str):
+        value = normalize_date_like_text(value)
+        return None if value is None else str(value)
+
     return str(value)
 
 
@@ -291,14 +329,8 @@ def clean_export_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for col in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[col]):
             out[col] = out[col].dt.strftime("%Y-%m-%d")
-        elif out[col].dtype == object:
-            def fix_obj(v):
-                if pd.isna(v):
-                    return None
-                if isinstance(v, pd.Timestamp):
-                    return v.strftime("%Y-%m-%d")
-                return v
-            out[col] = out[col].apply(fix_obj)
+        else:
+            out[col] = out[col].apply(normalize_date_like_text)
     return out
 
 
@@ -317,7 +349,7 @@ def dataframe_to_export_chunks(df: pd.DataFrame) -> list[list[dict]]:
 # =========================================================
 # DB READ
 # =========================================================
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=5)
 def load_active_upload_meta(dataset_key: str):
     sb = get_supabase()
     resp = (
@@ -334,7 +366,7 @@ def load_active_upload_meta(dataset_key: str):
     return resp.data[0]
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=30)
 def load_metrics_map(upload_id: int):
     sb = get_supabase()
     resp = (
@@ -352,7 +384,7 @@ def load_metrics_map(upload_id: int):
     return metrics
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=30)
 def load_table_records(table_name: str, upload_id: int, limit_rows: int | None = None):
     sb = get_supabase()
     query = sb.table(table_name).select("*").eq("upload_id", upload_id).order("id")
@@ -362,7 +394,7 @@ def load_table_records(table_name: str, upload_id: int, limit_rows: int | None =
     return resp.data or []
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)
 def load_export_df(upload_id: int, column_order: tuple):
     sb = get_supabase()
 
@@ -790,6 +822,43 @@ def render_page_header(title: str, subtitle: str = ""):
         st.markdown(f'<div class="page-subtitle">{subtitle}</div>', unsafe_allow_html=True)
 
 
+def render_local_time_card(uploaded_at: str):
+    if not uploaded_at:
+        html = """
+        <div class="metric-card" style="min-height:92px;">
+          <div class="small-muted">Updated at</div>
+          <div class="big-number-small">-</div>
+        </div>
+        """
+        st.markdown(html, unsafe_allow_html=True)
+        return
+
+    iso_str = str(uploaded_at)
+    html = f"""
+    <div class="metric-card" style="min-height:92px;">
+      <div class="small-muted">Updated at</div>
+      <div id="local-updated-time" class="big-number-small">Loading...</div>
+    </div>
+    <script>
+      const iso = {iso_str!r};
+      try {{
+        const dt = new Date(iso);
+        const txt = dt.toLocaleString(undefined, {{
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit"
+        }});
+        document.getElementById("local-updated-time").innerText = txt;
+      }} catch (e) {{
+        document.getElementById("local-updated-time").innerText = iso;
+      }}
+    </script>
+    """
+    components.html(html, height=96)
+
+
 def render_last_updated(upload_meta: dict | None):
     st.subheader("Last Updated")
     if not upload_meta:
@@ -801,31 +870,26 @@ def render_last_updated(upload_meta: dict | None):
     row_count = upload_meta.get("row_count", 0)
     filename = upload_meta.get("original_filename", "-")
 
-    try:
-        dt = pd.to_datetime(uploaded_at)
-        uploaded_at_fmt = dt.strftime("%d %b %Y, %I:%M %p")
-    except Exception:
-        uploaded_at_fmt = str(uploaded_at)
-
     c1, c2, c3, c4 = st.columns(4)
+
     with c1:
         st.markdown(
-            f'<div class="metric-card"><div class="small-muted">Updated by</div><div class="big-number" style="font-size:1.05rem;">{uploaded_by}</div></div>',
+            f'<div class="metric-card"><div class="small-muted">Updated by</div><div class="big-number-small">{uploaded_by}</div></div>',
             unsafe_allow_html=True
         )
+
     with c2:
-        st.markdown(
-            f'<div class="metric-card"><div class="small-muted">Updated at</div><div class="big-number" style="font-size:1.05rem;">{uploaded_at_fmt}</div></div>',
-            unsafe_allow_html=True
-        )
+        render_local_time_card(uploaded_at)
+
     with c3:
         st.markdown(
             f'<div class="metric-card"><div class="small-muted">Rows</div><div class="big-number">{row_count:,}</div></div>',
             unsafe_allow_html=True
         )
+
     with c4:
         st.markdown(
-            f'<div class="metric-card"><div class="small-muted">Source file</div><div class="big-number" style="font-size:1rem;">{filename}</div></div>',
+            f'<div class="metric-card"><div class="small-muted">Source file</div><div class="big-number-small">{filename}</div></div>',
             unsafe_allow_html=True
         )
 

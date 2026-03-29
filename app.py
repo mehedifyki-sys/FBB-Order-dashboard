@@ -90,14 +90,21 @@ div[data-testid="baseButton-secondary"] {
 """, unsafe_allow_html=True)
 
 # =========================================================
-# DATASET CONFIG
+# CONFIG
 # =========================================================
+EXPORT_CHUNK_ROWS = 500
+DB_INSERT_CHUNK = 40
+MAX_OPEN_ORDER_ROWS = 3000
+MAX_DUP_ROWS = 3000
+MAX_INVOICE_DETAIL_ROWS = 3000
+TOP_SHIPMENT_REF_CHART_ROWS = 50
+
 DATASETS = {
     "order_dashboard": {
         "label": "Order Dashboard",
         "download_name": "Order_Dashboard.xlsx",
         "cleanup_tables": [
-            "dataset_raw_rows",
+            "dataset_export_chunks",
             "dataset_metrics",
             "order_weekly_summary",
             "order_open_orders",
@@ -108,10 +115,9 @@ DATASETS = {
         "label": "FBB-Shipment Details",
         "download_name": "FBB_Shipment_Details.xlsx",
         "cleanup_tables": [
-            "dataset_raw_rows",
+            "dataset_export_chunks",
             "dataset_metrics",
             "shipment_weekly_summary",
-            "shipment_detail_compact",
             "shipment_ref_summary",
         ],
     },
@@ -119,7 +125,7 @@ DATASETS = {
         "label": "FBB Invoice Status",
         "download_name": "FBB_Invoice_Status.xlsx",
         "cleanup_tables": [
-            "dataset_raw_rows",
+            "dataset_export_chunks",
             "dataset_metrics",
             "invoice_status_summary",
             "invoice_team_summary",
@@ -166,10 +172,6 @@ def first_existing_column(df: pd.DataFrame, candidates):
     return None
 
 
-def parse_date_series(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
-
-
 def parse_numeric_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
@@ -209,44 +211,24 @@ def trim_text(value: Any, max_len: int):
     return text[:max_len]
 
 
-def batched(seq, size=50):
+def batched(seq, size=DB_INSERT_CHUNK):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
-
-
-def dataframe_to_raw_records(df: pd.DataFrame):
-    records = []
-    for i, row in df.iterrows():
-        row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
-        records.append({
-            "row_number": int(i) + 1,
-            "row_data": row_dict
-        })
-    return records
 
 
 def clear_caches():
     load_active_upload_meta.clear()
     load_metrics_map.clear()
     load_table_records.clear()
-    load_raw_export_df.clear()
+    load_export_df.clear()
 
 
-def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = 50):
+def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INSERT_CHUNK):
     if not rows:
         return
-
     sb = get_supabase()
     for chunk in batched(rows, chunk_size):
         sb.table(table_name).insert(chunk).execute()
-
-
-def delete_old_upload_related_data(old_upload_ids: list[int], dataset_key: str):
-    if not old_upload_ids:
-        return
-    sb = get_supabase()
-    for table_name in DATASETS[dataset_key]["cleanup_tables"]:
-        sb.table(table_name).delete().in_("upload_id", old_upload_ids).execute()
 
 
 def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
@@ -265,16 +247,23 @@ def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
     return old_ids
 
 
+def delete_old_upload_related_data(old_upload_ids: list[int], dataset_key: str):
+    if not old_upload_ids:
+        return
+    sb = get_supabase()
+    for table_name in DATASETS[dataset_key]["cleanup_tables"]:
+        sb.table(table_name).delete().in_("upload_id", old_upload_ids).execute()
+
+
 def week_sort_parts(value):
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return (999999, 999999, "")
 
     text = str(value).strip()
-
-    main_match = re.search(r'(\d+)', text)
+    main_match = re.search(r"(\d+)", text)
     main_num = int(main_match.group(1)) if main_match else 999999
 
-    suffix_match = re.search(r'#(\d+)', text)
+    suffix_match = re.search(r"#(\d+)", text)
     suffix_num = int(suffix_match.group(1)) if suffix_match else 0
 
     return (main_num, suffix_num, text.lower())
@@ -283,7 +272,6 @@ def week_sort_parts(value):
 def sort_week_dataframe(df: pd.DataFrame, week_col: str) -> pd.DataFrame:
     if df.empty or week_col not in df.columns:
         return df
-
     tmp = df.copy()
     tmp["_week_sort"] = tmp[week_col].apply(week_sort_parts)
     tmp = tmp.sort_values("_week_sort").drop(columns=["_week_sort"])
@@ -300,7 +288,6 @@ def search_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
 
 def clean_export_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
     for col in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[col]):
             out[col] = out[col].dt.strftime("%Y-%m-%d")
@@ -312,12 +299,23 @@ def clean_export_dataframe(df: pd.DataFrame) -> pd.DataFrame:
                     return v.strftime("%Y-%m-%d")
                 return v
             out[col] = out[col].apply(fix_obj)
-
     return out
 
 
+def dataframe_to_export_chunks(df: pd.DataFrame) -> list[list[dict]]:
+    normalized_records = []
+    for _, row in df.iterrows():
+        row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
+        normalized_records.append(row_dict)
+
+    chunks = []
+    for i in range(0, len(normalized_records), EXPORT_CHUNK_ROWS):
+        chunks.append(normalized_records[i:i + EXPORT_CHUNK_ROWS])
+    return chunks
+
+
 # =========================================================
-# DB READ HELPERS
+# DB READ
 # =========================================================
 @st.cache_data(ttl=600)
 def load_active_upload_meta(dataset_key: str):
@@ -365,30 +363,35 @@ def load_table_records(table_name: str, upload_id: int, limit_rows: int | None =
 
 
 @st.cache_data(ttl=600)
-def load_raw_export_df(upload_id: int, column_order: tuple):
+def load_export_df(upload_id: int, column_order: tuple):
     sb = get_supabase()
 
-    all_rows = []
-    last_row_number = 0
+    all_chunks = []
+    last_chunk_index = -1
     page_size = 1000
 
     while True:
         resp = (
-            sb.table("dataset_raw_rows")
-            .select("row_number,row_data")
+            sb.table("dataset_export_chunks")
+            .select("chunk_index,chunk_data")
             .eq("upload_id", upload_id)
-            .gt("row_number", last_row_number)
-            .order("row_number")
+            .gt("chunk_index", last_chunk_index)
+            .order("chunk_index")
             .limit(page_size)
             .execute()
         )
         batch = resp.data or []
         if not batch:
             break
-        all_rows.extend(batch)
-        last_row_number = batch[-1]["row_number"]
+        all_chunks.extend(batch)
+        last_chunk_index = batch[-1]["chunk_index"]
 
-    records = [r["row_data"] for r in all_rows]
+    records = []
+    for row in all_chunks:
+        chunk_data = row.get("chunk_data", [])
+        if isinstance(chunk_data, list):
+            records.extend(chunk_data)
+
     df = pd.DataFrame(records)
 
     ordered_cols = [c for c in column_order if c in df.columns]
@@ -399,8 +402,7 @@ def load_raw_export_df(upload_id: int, column_order: tuple):
     else:
         df = pd.DataFrame(columns=list(column_order))
 
-    df = clean_export_dataframe(df)
-    return df
+    return clean_export_dataframe(df)
 
 
 def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
@@ -412,7 +414,7 @@ def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
 
 
 # =========================================================
-# DATA PREPARATION
+# BUILD DATA
 # =========================================================
 def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
     order_col = first_existing_column(df, ["BC Order", "SalesDocument"])
@@ -428,11 +430,7 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
     work = df.copy()
 
     total_orders = work[order_col].nunique() if order_col else len(work)
-
-    status_series = (
-        work[status_col].astype(str).str.strip().str.lower()
-        if status_col else pd.Series([], dtype="object")
-    )
+    status_series = work[status_col].astype(str).str.strip().str.lower() if status_col else pd.Series([], dtype="object")
 
     open_count = int(status_series.str.contains("open", na=False).sum()) if status_col else 0
     shipped_count = int(status_series.str.contains("ship", na=False).sum()) if status_col else 0
@@ -452,7 +450,6 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
             .nunique()
             .reset_index(name="orders_count")
         )
-
         if status_col:
             week_status = (
                 work.groupby(batch_col)[status_col]
@@ -479,6 +476,8 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
     else:
         open_df = work.copy()
 
+    open_df = open_df.head(MAX_OPEN_ORDER_ROWS)
+
     for _, row in open_df.iterrows():
         open_rows.append({
             "upload_id": upload_id,
@@ -498,7 +497,7 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
         dup_df = work.copy()
         dup_df["dup_key"] = dup_df[order_col].astype(str).str.strip() + "||" + dup_df[material_col].astype(str).str.strip()
         dup_df["dup_count"] = dup_df.groupby("dup_key")["dup_key"].transform("count")
-        duplicates = dup_df[dup_df["dup_count"] > 1].copy()
+        duplicates = dup_df[dup_df["dup_count"] > 1].copy().head(MAX_DUP_ROWS)
 
         for _, row in duplicates.iterrows():
             duplicate_rows.append({
@@ -523,7 +522,6 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
     ship_ref_col = first_existing_column(df, ["Shipment Ref#"])
 
     work = df.copy()
-
     if qty_col:
         work[qty_col] = parse_numeric_series(work[qty_col])
 
@@ -564,14 +562,33 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
 
     ref_summary_rows = []
     if ship_ref_col and not shipped_df.empty:
-        ref_summary = (
-            shipped_df.groupby(ship_ref_col, dropna=False)
-            .agg(
-                unique_orders=(order_col, "nunique") if order_col else (ship_ref_col, "count"),
-                total_qty_shipped=(qty_col, "sum") if qty_col else (ship_ref_col, "count"),
+        if order_col and qty_col:
+            ref_summary = (
+                shipped_df.groupby(ship_ref_col, dropna=False)
+                .agg(unique_orders=(order_col, "nunique"), total_qty_shipped=(qty_col, "sum"))
+                .reset_index()
             )
-            .reset_index()
-        )
+        elif order_col:
+            ref_summary = (
+                shipped_df.groupby(ship_ref_col, dropna=False)
+                .agg(unique_orders=(order_col, "nunique"))
+                .reset_index()
+            )
+            ref_summary["total_qty_shipped"] = None
+        elif qty_col:
+            ref_summary = (
+                shipped_df.groupby(ship_ref_col, dropna=False)
+                .agg(total_qty_shipped=(qty_col, "sum"))
+                .reset_index()
+            )
+            ref_summary["unique_orders"] = None
+        else:
+            ref_summary = (
+                shipped_df.groupby(ship_ref_col, dropna=False)
+                .size()
+                .reset_index(name="unique_orders")
+            )
+            ref_summary["total_qty_shipped"] = None
 
         for _, row in ref_summary.iterrows():
             ref_summary_rows.append({
@@ -581,8 +598,7 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
                 "total_qty_shipped": safe_num(row["total_qty_shipped"]),
             })
 
-    compact_rows = []
-    return metrics_rows, weekly_rows, ref_summary_rows, compact_rows
+    return metrics_rows, weekly_rows, ref_summary_rows
 
 
 def build_invoice_data(df: pd.DataFrame, upload_id: int):
@@ -626,11 +642,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
 
     status_rows = []
     if status_col:
-        summary = (
-            work.groupby(status_col, dropna=False)
-            .size()
-            .reset_index(name="row_count")
-        )
+        summary = work.groupby(status_col, dropna=False).size().reset_index(name="row_count")
         for _, row in summary.iterrows():
             status_rows.append({
                 "upload_id": upload_id,
@@ -653,7 +665,8 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
             })
 
     compact_rows = []
-    for _, row in work.iterrows():
+    compact_df = work.head(MAX_INVOICE_DETAIL_ROWS)
+    for _, row in compact_df.iterrows():
         compact_rows.append({
             "upload_id": upload_id,
             "sp_no": trim_text(row[sp_col], 100) if sp_col else None,
@@ -678,20 +691,24 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
 
 
 # =========================================================
-# UPLOAD LOGIC
+# UPLOAD
 # =========================================================
 def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
+    progress = st.progress(0, text="Reading file...")
+
     try:
         excel = pd.ExcelFile(uploaded_file)
         sheet_name = excel.sheet_names[0]
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
     except Exception as e:
+        progress.empty()
         return False, f"Could not read Excel file: {e}"
 
     df.columns = [str(c).strip() for c in df.columns]
     df = df.dropna(how="all").reset_index(drop=True)
 
     if df.empty:
+        progress.empty()
         return False, "Uploaded file is empty after removing blank rows."
 
     sb = get_supabase()
@@ -707,50 +724,60 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     }
 
     try:
+        progress.progress(5, text="Creating upload metadata...")
         upload_resp = sb.table("app_uploads").insert(upload_payload).execute()
         upload_id = upload_resp.data[0]["id"]
 
-        raw_rows = [
-            {
+        progress.progress(15, text="Preparing export chunks...")
+        export_chunks = dataframe_to_export_chunks(df)
+        export_rows = []
+        for idx, chunk in enumerate(export_chunks):
+            export_rows.append({
                 "upload_id": upload_id,
-                "row_number": item["row_number"],
-                "row_data": item["row_data"],
-            }
-            for item in dataframe_to_raw_records(df)
-        ]
-        raw_chunk_size = 100 if dataset_key == "fbb_shipment_details" else 50
-        insert_in_chunks("dataset_raw_rows", raw_rows, raw_chunk_size)
+                "chunk_index": idx,
+                "row_count": len(chunk),
+                "chunk_data": chunk,
+            })
+
+        progress.progress(30, text="Saving export data...")
+        insert_in_chunks("dataset_export_chunks", export_rows, 20)
 
         if dataset_key == "order_dashboard":
+            progress.progress(45, text="Building order dashboard...")
             metrics_rows, weekly_rows, open_rows, duplicate_rows = build_order_dashboard_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, 50)
-            insert_in_chunks("order_weekly_summary", weekly_rows, 50)
-            insert_in_chunks("order_open_orders", open_rows, 50)
-            insert_in_chunks("order_duplicate_lines", duplicate_rows, 50)
+            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("order_weekly_summary", weekly_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("order_open_orders", open_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("order_duplicate_lines", duplicate_rows, DB_INSERT_CHUNK)
 
         elif dataset_key == "fbb_shipment_details":
-            metrics_rows, weekly_rows, ref_summary_rows, compact_rows = build_shipment_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, 50)
-            insert_in_chunks("shipment_weekly_summary", weekly_rows, 50)
-            insert_in_chunks("shipment_ref_summary", ref_summary_rows, 50)
-            if compact_rows:
-                insert_in_chunks("shipment_detail_compact", compact_rows, 50)
+            progress.progress(45, text="Building shipment dashboard...")
+            metrics_rows, weekly_rows, ref_summary_rows = build_shipment_data(df, upload_id)
+            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("shipment_weekly_summary", weekly_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("shipment_ref_summary", ref_summary_rows, DB_INSERT_CHUNK)
 
         elif dataset_key == "fbb_invoice_status":
+            progress.progress(45, text="Building invoice dashboard...")
             metrics_rows, status_rows, team_rows, compact_rows = build_invoice_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, 50)
-            insert_in_chunks("invoice_status_summary", status_rows, 50)
-            insert_in_chunks("invoice_team_summary", team_rows, 50)
-            insert_in_chunks("invoice_detail_compact", compact_rows, 50)
+            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("invoice_status_summary", status_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("invoice_team_summary", team_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("invoice_detail_compact", compact_rows, DB_INSERT_CHUNK)
 
+        progress.progress(90, text="Cleaning previous active upload...")
         old_upload_ids = deactivate_old_uploads(dataset_key, upload_id)
         delete_old_upload_related_data(old_upload_ids, dataset_key)
 
         clear_caches()
         st.session_state.export_ready_for = None
+        progress.progress(100, text="Upload complete.")
+        progress.empty()
+
         return True, f"{DATASETS[dataset_key]['label']} uploaded successfully. Rows: {len(df):,}"
 
     except Exception as e:
+        progress.empty()
         return False, f"Upload failed: {e}"
 
 
@@ -856,7 +883,7 @@ def render_export_section(dataset_key: str, upload_meta: dict | None):
     with dl_col:
         if st.session_state.export_ready_for == dataset_key:
             with st.spinner("Preparing export..."):
-                export_df = load_raw_export_df(upload_id, column_order)
+                export_df = load_export_df(upload_id, column_order)
                 export_bytes = excel_bytes_from_df(export_df, sheet_name)
 
             st.download_button(
@@ -905,22 +932,19 @@ def admin_sidebar():
         if st.button("🏠 Home", use_container_width=True):
             st.session_state.page = "home"
             st.rerun()
-
         if st.button("📦 Order Dashboard", use_container_width=True):
             st.session_state.page = "order_dashboard"
             st.rerun()
-
         if st.button("🚚 FBB-Shipment Details", use_container_width=True):
             st.session_state.page = "fbb_shipment_details"
             st.rerun()
-
         if st.button("🧾 FBB Invoice Status", use_container_width=True):
             st.session_state.page = "fbb_invoice_status"
             st.rerun()
 
 
 # =========================================================
-# HOME PAGE
+# PAGES
 # =========================================================
 def home_page():
     render_page_header("Operations Dashboard", "Select a dashboard.")
@@ -970,9 +994,6 @@ def home_page():
     st.info("Viewer mode can analyze and export. Only admin can upload and replace data.")
 
 
-# =========================================================
-# ORDER DASHBOARD PAGE
-# =========================================================
 def page_order_dashboard():
     render_page_header("Order Dashboard", "Order-level summary, week analysis, open lines and duplicate check.")
 
@@ -1007,7 +1028,7 @@ def page_order_dashboard():
         st.dataframe(weekly_df, use_container_width=True, height=260)
 
     st.subheader("Open Orders")
-    open_rows = load_table_records("order_open_orders", upload_id, limit_rows=2000)
+    open_rows = load_table_records("order_open_orders", upload_id, limit_rows=MAX_OPEN_ORDER_ROWS)
     if open_rows:
         open_df = pd.DataFrame(open_rows)[[
             "bc_order", "sales_document", "material_number", "status_value",
@@ -1015,13 +1036,13 @@ def page_order_dashboard():
         ]]
         search_text = st.text_input("Search Open Orders", key="search_open_orders")
         open_df = search_dataframe(open_df, search_text)
-        st.caption("Showing up to 2,000 open-order rows for faster viewing.")
+        st.caption(f"Showing up to {MAX_OPEN_ORDER_ROWS:,} open-order rows for faster viewing.")
         st.dataframe(open_df, use_container_width=True, height=360)
     else:
         st.info("No open orders found.")
 
     st.subheader("Duplicate Line Checker")
-    dup_rows = load_table_records("order_duplicate_lines", upload_id, limit_rows=2000)
+    dup_rows = load_table_records("order_duplicate_lines", upload_id, limit_rows=MAX_DUP_ROWS)
     if dup_rows:
         dup_df = pd.DataFrame(dup_rows)[[
             "bc_order", "sales_document", "material_number", "batch_number",
@@ -1029,15 +1050,12 @@ def page_order_dashboard():
         ]]
         dup_search = st.text_input("Search Duplicate Lines", key="search_duplicate_lines")
         dup_df = search_dataframe(dup_df, dup_search)
-        st.caption("Showing up to 2,000 duplicate rows for faster viewing.")
+        st.caption(f"Showing up to {MAX_DUP_ROWS:,} duplicate rows for faster viewing.")
         st.dataframe(dup_df, use_container_width=True, height=340)
     else:
         st.success("No duplicate order + material combinations found.")
 
 
-# =========================================================
-# SHIPMENT PAGE
-# =========================================================
 def page_fbb_shipment_details():
     render_page_header("FBB-Shipment Details", "Shipment overview by BD Shipment Ref#.")
 
@@ -1079,15 +1097,10 @@ def page_fbb_shipment_details():
         search_text = st.text_input("Search Shipment Ref#", key="search_shipment_ref")
         ref_df = search_dataframe(ref_df, search_text)
 
-        chart_df = ref_df.head(50).copy()
+        chart_df = ref_df.head(TOP_SHIPMENT_REF_CHART_ROWS).copy()
         if not chart_df.empty:
             st.subheader("Top Shipment References by Qty Shipped")
-            fig = px.bar(
-                chart_df,
-                x="shipment_ref",
-                y="total_qty_shipped",
-                hover_data=chart_df.columns
-            )
+            fig = px.bar(chart_df, x="shipment_ref", y="total_qty_shipped", hover_data=chart_df.columns)
             st.plotly_chart(fig, use_container_width=True)
 
         st.dataframe(ref_df, use_container_width=True, height=420)
@@ -1095,9 +1108,6 @@ def page_fbb_shipment_details():
         st.info("No BD shipment references found.")
 
 
-# =========================================================
-# INVOICE PAGE
-# =========================================================
 def page_fbb_invoice_status():
     render_page_header("FBB Invoice Status", "Invoice progress, remaining quantity and team/status analysis.")
 
@@ -1137,7 +1147,7 @@ def page_fbb_invoice_status():
         st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Invoice Detail Table")
-    detail_rows = load_table_records("invoice_detail_compact", upload_id, limit_rows=2000)
+    detail_rows = load_table_records("invoice_detail_compact", upload_id, limit_rows=MAX_INVOICE_DETAIL_ROWS)
     if detail_rows:
         detail_df = pd.DataFrame(detail_rows)[[
             "sp_no", "bd_ref", "cs_ref", "number_of_orders", "number_of_invoiced_orders",
@@ -1147,8 +1157,7 @@ def page_fbb_invoice_status():
         ]]
         invoice_search = st.text_input("Search Invoice Details", key="search_invoice_details")
         detail_df = search_dataframe(detail_df, invoice_search)
-
-        st.caption("Showing up to 2,000 rows for faster viewing.")
+        st.caption(f"Showing up to {MAX_INVOICE_DETAIL_ROWS:,} rows for faster viewing.")
         st.dataframe(detail_df, use_container_width=True, height=420)
     else:
         st.info("No invoice rows found.")

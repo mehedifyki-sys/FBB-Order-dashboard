@@ -8,6 +8,9 @@ import streamlit as st
 from supabase import create_client, Client
 
 
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 st.set_page_config(
     page_title="Operations Dashboard",
     page_icon="📊",
@@ -15,94 +18,129 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# =========================================================
+# STYLES
+# =========================================================
+st.markdown("""
+<style>
+/* -------- Main layout spacing -------- */
+.block-container {
+    padding-top: 2.6rem !important;
+    padding-bottom: 2rem !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+}
 
+/* prevent title/header cutting */
+h1, h2, h3 {
+    padding-top: 0.2rem !important;
+    margin-top: 0 !important;
+}
+
+/* -------- Custom components -------- */
+.page-title {
+    font-size: 2.1rem;
+    font-weight: 800;
+    margin-bottom: 0.4rem;
+    line-height: 1.25;
+    padding-top: 0.2rem;
+}
+
+.page-subtitle {
+    color: #9aa0a6;
+    font-size: 1rem;
+    margin-bottom: 1rem;
+}
+
+.card {
+    border: 1px solid rgba(140, 140, 140, 0.22);
+    border-radius: 18px;
+    padding: 20px 18px;
+    background: rgba(255,255,255,0.03);
+    min-height: 138px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+
+.metric-card {
+    border: 1px solid rgba(140, 140, 140, 0.22);
+    border-radius: 16px;
+    padding: 14px 16px;
+    background: rgba(255,255,255,0.03);
+    min-height: 92px;
+}
+
+.section-box {
+    border: 1px solid rgba(140, 140, 140, 0.18);
+    border-radius: 18px;
+    padding: 18px;
+    background: rgba(255,255,255,0.02);
+}
+
+.small-muted {
+    color: #9aa0a6;
+    font-size: 0.92rem;
+    margin-bottom: 6px;
+}
+
+.big-number {
+    font-size: 1.75rem;
+    font-weight: 750;
+    line-height: 1.2;
+}
+
+hr {
+    margin-top: 1.5rem !important;
+    margin-bottom: 1.5rem !important;
+}
+
+div[data-testid="stMetric"] {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(140, 140, 140, 0.15);
+    padding: 14px 16px;
+    border-radius: 16px;
+}
+
+div[data-testid="stFileUploader"] {
+    border-radius: 14px;
+}
+
+div[data-testid="stDownloadButton"] > button,
+div[data-testid="stButton"] > button,
+div[data-testid="baseButton-secondary"] {
+    border-radius: 12px !important;
+    min-height: 42px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# =========================================================
+# DATASET CONFIG
+# =========================================================
 DATASETS = {
     "order_dashboard": {
         "label": "Order Dashboard",
         "rows_table": "order_dashboard_rows",
         "download_name": "Order_Dashboard.xlsx",
-        "expected_headers": [
-            "BC Order",
-            "MaterialNumber",
-            "BatchNumber",
-            "Order Status",
-            "Status",
-            "OrderDate",
-            "BC Order Date",
-            "CDD",
-            "ClubName",
-            "OrderType",
-            "SalesDocument",
-        ],
     },
     "fbb_shipment_details": {
         "label": "FBB-Shipment Details",
         "rows_table": "fbb_shipment_details_rows",
         "download_name": "FBB_Shipment_Details.xlsx",
-        "expected_headers": [
-            "Sales Doc",
-            "ORDER #",
-            "SKU/ ITEM #",
-            "Order qty",
-            "WEEK",
-            "DATE",
-            "Code",
-            "Shipment Ref#",
-            "UPS TRACKING # (NO SPACE)",
-        ],
     },
     "fbb_invoice_status": {
         "label": "FBB Invoice Status",
         "rows_table": "fbb_invoice_status_rows",
         "download_name": "FBB_Invoice_Status.xlsx",
-        "expected_headers": [
-            "SP#",
-            "BD Ref#",
-            "CS Ref#",
-            "Number of Orders",
-            "Number of Invoiced Orders",
-            "Remaining Orders to Invoice",
-            "Total Qty Shipped",
-            "Total Amount",
-            "Invoiced Qty",
-            "Remaining Qty to invoice",
-            "Remaining Amount to invoice",
-            "Hand Over",
-            "UPS Pickup Date",
-            "#Days",
-            "Status",
-            "Team",
-        ],
     },
 }
 
 
-st.markdown(
-    """
-<style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-.card {
-    border: 1px solid rgba(120,120,120,0.25);
-    border-radius: 18px;
-    padding: 18px;
-    background: rgba(255,255,255,0.03);
-    min-height: 130px;
-}
-.metric-card {
-    border: 1px solid rgba(120,120,120,0.2);
-    border-radius: 16px;
-    padding: 14px 16px;
-    background: rgba(255,255,255,0.03);
-}
-.small-muted {color: #9aa0a6; font-size: 0.92rem;}
-.big-number {font-size: 1.8rem; font-weight: 700; margin-top: 4px;}
-.page-title {font-size: 1.9rem; font-weight: 800; margin-bottom: 0.35rem;}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
+# =========================================================
+# BASIC HELPERS
+# =========================================================
 def sha256_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -125,26 +163,14 @@ def get_supabase() -> Client:
     return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
 
-def normalize_value_for_json(value):
-    if pd.isna(value):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    return value
-
-
-def dataframe_to_records(df: pd.DataFrame):
-    records = []
-    for i, row in df.iterrows():
-        row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
-        records.append({"row_number": int(i) + 1, "row_data": row_dict})
-    return records
+def current_admin_name():
+    return st.secrets.get("ADMIN_DISPLAY_NAME", st.secrets.get("ADMIN_USERNAME", "Admin"))
 
 
 def first_existing_column(df: pd.DataFrame, candidates):
-    for c in candidates:
-        if c in df.columns:
-            return c
+    for col in candidates:
+        if col in df.columns:
+            return col
     return None
 
 
@@ -156,56 +182,12 @@ def parse_numeric_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def current_admin_name():
-    return st.secrets.get("ADMIN_DISPLAY_NAME", st.secrets.get("ADMIN_USERNAME", "Admin"))
-
-
-def render_last_updated(upload_meta: dict | None):
-    st.subheader("Last Updated")
-    if not upload_meta:
-        st.info("No upload found yet.")
-        return
-
-    uploaded_by = upload_meta.get("uploaded_by", "-")
-    uploaded_at = upload_meta.get("uploaded_at", "")
-    row_count = upload_meta.get("row_count", 0)
-    filename = upload_meta.get("original_filename", "-")
-
-    try:
-        dt = pd.to_datetime(uploaded_at)
-        uploaded_at_fmt = dt.strftime("%d %b %Y, %I:%M %p")
-    except Exception:
-        uploaded_at_fmt = str(uploaded_at)
-
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(
-            '<div class="metric-card"><div class="small-muted">Updated by</div><div class="big-number" style="font-size:1.1rem;">{}</div></div>'.format(uploaded_by),
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            '<div class="metric-card"><div class="small-muted">Updated at</div><div class="big-number" style="font-size:1.1rem;">{}</div></div>'.format(uploaded_at_fmt),
-            unsafe_allow_html=True,
-        )
-    with c3:
-        st.markdown(
-            '<div class="metric-card"><div class="small-muted">Rows</div><div class="big-number">{}</div></div>'.format(row_count),
-            unsafe_allow_html=True,
-        )
-    with c4:
-        st.markdown(
-            '<div class="metric-card"><div class="small-muted">Source file</div><div class="big-number" style="font-size:1.0rem;">{}</div></div>'.format(filename),
-            unsafe_allow_html=True,
-        )
-
-
-def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name[:31] if sheet_name else "Data")
-    output.seek(0)
-    return output.getvalue()
+def normalize_value_for_json(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
 
 
 def batched(seq, size=500):
@@ -213,6 +195,124 @@ def batched(seq, size=500):
         yield seq[i:i + size]
 
 
+def dataframe_to_records(df: pd.DataFrame):
+    records = []
+    for i, row in df.iterrows():
+        row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
+        records.append({
+            "row_number": int(i) + 1,
+            "row_data": row_dict
+        })
+    return records
+
+
+def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=(sheet_name[:31] if sheet_name else "Data"))
+    output.seek(0)
+    return output.getvalue()
+
+
+# =========================================================
+# CACHE CLEAR
+# =========================================================
+def clear_caches():
+    load_active_upload_meta.clear()
+    load_dataset_df.clear()
+
+
+# =========================================================
+# DATABASE READ HELPERS
+# =========================================================
+@st.cache_data(ttl=30)
+def load_active_upload_meta(dataset_key: str):
+    sb = get_supabase()
+    try:
+        resp = (
+            sb.table("app_uploads")
+            .select("id,dataset_key,original_filename,uploaded_by,uploaded_at,row_count,column_order,sheet_name,is_active")
+            .eq("dataset_key", dataset_key)
+            .eq("is_active", True)
+            .order("id", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if not resp.data:
+            return None
+        return resp.data[0]
+    except Exception as e:
+        st.error(f"Metadata load error: {e}")
+        return None
+
+
+@st.cache_data(ttl=30)
+def load_dataset_df(dataset_key: str):
+    cfg = DATASETS[dataset_key]
+    upload_meta = load_active_upload_meta(dataset_key)
+
+    if not upload_meta:
+        return pd.DataFrame(), None
+
+    sb = get_supabase()
+    upload_id = upload_meta["id"]
+
+    try:
+        count_resp = (
+            sb.table(cfg["rows_table"])
+            .select("id", count="exact")
+            .eq("upload_id", upload_id)
+            .execute()
+        )
+        total_count = count_resp.count or 0
+    except Exception as e:
+        st.error(f"Row count load error: {e}")
+        return pd.DataFrame(), upload_meta
+
+    all_rows = []
+    page_size = 1000
+    start = 0
+
+    while start < total_count:
+        end = min(start + page_size - 1, total_count - 1)
+        try:
+            resp = (
+                sb.table(cfg["rows_table"])
+                .select("row_number,row_data")
+                .eq("upload_id", upload_id)
+                .order("row_number")
+                .range(start, end)
+                .execute()
+            )
+        except Exception as e:
+            st.error(f"Row page load error ({start}-{end}): {e}")
+            break
+
+        batch = resp.data or []
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        start += page_size
+
+    records = [r["row_data"] for r in all_rows]
+    df = pd.DataFrame(records)
+
+    column_order = upload_meta.get("column_order", []) or []
+    ordered_cols = [c for c in column_order if c in df.columns]
+    extra_cols = [c for c in df.columns if c not in ordered_cols]
+
+    if len(df.columns) > 0:
+        df = df[ordered_cols + extra_cols]
+    else:
+        df = pd.DataFrame(columns=column_order)
+
+    return df, upload_meta
+
+
+# =========================================================
+# DATABASE WRITE HELPERS
+# =========================================================
 def set_old_uploads_inactive(sb: Client, dataset_key: str, new_upload_id: int):
     existing = (
         sb.table("app_uploads")
@@ -226,6 +326,7 @@ def set_old_uploads_inactive(sb: Client, dataset_key: str, new_upload_id: int):
 
     if old_ids:
         sb.table("app_uploads").update({"is_active": False}).in_("id", old_ids).execute()
+
     return old_ids
 
 
@@ -268,202 +369,89 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         records = dataframe_to_records(df)
         for chunk in batched(records, 500):
             payload = [
-                {"upload_id": upload_id, "row_number": item["row_number"], "row_data": item["row_data"]}
+                {
+                    "upload_id": upload_id,
+                    "row_number": item["row_number"],
+                    "row_data": item["row_data"],
+                }
                 for item in chunk
             ]
             sb.table(cfg["rows_table"]).insert(payload).execute()
 
-                # verify inserted row count
         verify_resp = (
             sb.table(cfg["rows_table"])
             .select("id", count="exact")
             .eq("upload_id", upload_id)
             .execute()
         )
+        inserted_count = verify_resp.count or 0
 
-        inserted_count = verify_resp.count if hasattr(verify_resp, "count") else None
-
-        if inserted_count is not None and inserted_count != len(df):
+        if inserted_count != len(df):
             return False, f"Upload mismatch: expected {len(df)} rows but found {inserted_count} rows in database."
 
         old_upload_ids = set_old_uploads_inactive(sb, dataset_key, upload_id)
         delete_old_rows(sb, cfg["rows_table"], old_upload_ids)
 
         clear_caches()
-        return True, f"{cfg['label']} uploaded successfully."
+        return True, f"{cfg['label']} uploaded successfully. Loaded rows: {inserted_count:,}"
+
     except Exception as e:
         return False, f"Upload failed: {e}"
 
 
-def clear_caches():
-    load_active_upload_meta.clear()
-    load_dataset_df.clear()
+# =========================================================
+# UI HELPERS
+# =========================================================
+def render_page_header(title: str, subtitle: str = ""):
+    st.markdown(f'<div class="page-title">{title}</div>', unsafe_allow_html=True)
+    if subtitle:
+        st.markdown(f'<div class="page-subtitle">{subtitle}</div>', unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=60)
-def load_active_upload_meta(dataset_key: str):
-    sb = get_supabase()
-    resp = (
-        sb.table("app_uploads")
-        .select("*")
-        .eq("dataset_key", dataset_key)
-        .eq("is_active", True)
-        .order("uploaded_at", desc=True)
-        .limit(1)
-        .execute()
-    )
-    if not resp.data:
-        return None
-    return resp.data[0]
-
-
-@st.cache_data(ttl=60)
-def load_dataset_df(dataset_key: str):
-    cfg = DATASETS[dataset_key]
-    upload_meta = load_active_upload_meta(dataset_key)
-
+def render_last_updated(upload_meta: dict | None):
+    st.subheader("Last Updated")
     if not upload_meta:
-        return pd.DataFrame(), None
+        st.info("No upload found yet.")
+        return
 
-    sb = get_supabase()
-    upload_id = upload_meta["id"]
-    expected_rows = int(upload_meta.get("row_count", 0))
+    uploaded_by = upload_meta.get("uploaded_by", "-")
+    uploaded_at = upload_meta.get("uploaded_at", "")
+    row_count = upload_meta.get("row_count", 0)
+    filename = upload_meta.get("original_filename", "-")
 
-    all_rows = []
-    page_size = 500
-    start = 0
+    try:
+        dt = pd.to_datetime(uploaded_at)
+        uploaded_at_fmt = dt.strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        uploaded_at_fmt = str(uploaded_at)
 
-    while start < expected_rows:
-        end = min(start + page_size - 1, expected_rows - 1)
-
-        resp = (
-            sb.table(cfg["rows_table"])
-            .select("row_number,row_data")
-            .eq("upload_id", upload_id)
-            .order("row_number")
-            .range(start, end)
-            .execute()
-        )
-
-        batch = resp.data or []
-        if not batch:
-            break
-
-        all_rows.extend(batch)
-        start += page_size
-
-    records = [r["row_data"] for r in all_rows]
-    df = pd.DataFrame(records)
-
-    column_order = upload_meta.get("column_order", []) or []
-    ordered_cols = [c for c in column_order if c in df.columns]
-    extra_cols = [c for c in df.columns if c not in ordered_cols]
-
-    if len(df.columns) > 0:
-        df = df[ordered_cols + extra_cols]
-    else:
-        df = pd.DataFrame(columns=column_order)
-
-    return df, upload_meta
-
-
-def admin_sidebar():
-    with st.sidebar:
-        st.title("Control Panel")
-        st.caption("Production dashboard")
-
-        if st.session_state.admin_logged_in:
-            st.success(f"Admin logged in: {st.session_state.admin_user}")
-            if st.button("Logout", use_container_width=True):
-                st.session_state.admin_logged_in = False
-                st.session_state.admin_user = ""
-                st.rerun()
-        else:
-            st.markdown("### Admin Login")
-            username = st.text_input("Username", key="login_username")
-            password = st.text_input("Password", type="password", key="login_password")
-            if st.button("Login", use_container_width=True):
-                user_ok = safe_equal(username, st.secrets["ADMIN_USERNAME"])
-                pw_ok = safe_equal(sha256_text(password), st.secrets["ADMIN_PASSWORD_HASH"])
-                if user_ok and pw_ok:
-                    st.session_state.admin_logged_in = True
-                    st.session_state.admin_user = current_admin_name()
-                    st.success("Admin login successful.")
-                    st.rerun()
-                else:
-                    st.error("Invalid username or password.")
-
-        st.divider()
-        st.markdown("### Navigation")
-        if st.button("🏠 Home", use_container_width=True):
-            st.session_state.page = "home"
-            st.rerun()
-        if st.button("📦 Order Dashboard", use_container_width=True):
-            st.session_state.page = "order_dashboard"
-            st.rerun()
-        if st.button("🚚 FBB-Shipment Details", use_container_width=True):
-            st.session_state.page = "fbb_shipment_details"
-            st.rerun()
-        if st.button("🧾 FBB Invoice Status", use_container_width=True):
-            st.session_state.page = "fbb_invoice_status"
-            st.rerun()
-
-
-def home_page():
-    st.markdown('<div class="page-title">Operations Dashboard</div>', unsafe_allow_html=True)
-    st.write("Select a dashboard.")
-
-    c1, c2, c3 = st.columns(3)
-
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(
-            """
-        <div class="card">
-            <h3>Order Dashboard</h3>
-            <p>Order KPIs, weekly view, open orders, duplicate checker.</p>
-        </div>
-        """,
-            unsafe_allow_html=True,
+            f'<div class="metric-card"><div class="small-muted">Updated by</div><div class="big-number" style="font-size:1.05rem;">{uploaded_by}</div></div>',
+            unsafe_allow_html=True
         )
-        if st.button("Open Order Dashboard", key="go_order", use_container_width=True):
-            st.session_state.page = "order_dashboard"
-            st.rerun()
-
     with c2:
         st.markdown(
-            """
-        <div class="card">
-            <h3>FBB-Shipment Details</h3>
-            <p>Shipment references, weekly shipment analysis, tracking overview.</p>
-        </div>
-        """,
-            unsafe_allow_html=True,
+            f'<div class="metric-card"><div class="small-muted">Updated at</div><div class="big-number" style="font-size:1.05rem;">{uploaded_at_fmt}</div></div>',
+            unsafe_allow_html=True
         )
-        if st.button("Open FBB-Shipment Details", key="go_ship", use_container_width=True):
-            st.session_state.page = "fbb_shipment_details"
-            st.rerun()
-
     with c3:
         st.markdown(
-            """
-        <div class="card">
-            <h3>FBB Invoice Status</h3>
-            <p>Invoice progress, remaining quantity, status/team analysis.</p>
-        </div>
-        """,
-            unsafe_allow_html=True,
+            f'<div class="metric-card"><div class="small-muted">Rows</div><div class="big-number">{row_count:,}</div></div>',
+            unsafe_allow_html=True
         )
-        if st.button("Open FBB Invoice Status", key="go_invoice", use_container_width=True):
-            st.session_state.page = "fbb_invoice_status"
-            st.rerun()
-
-    st.divider()
-    st.info("Viewer mode can analyze and export. Only admin can upload and replace data.")
+    with c4:
+        st.markdown(
+            f'<div class="metric-card"><div class="small-muted">Source file</div><div class="big-number" style="font-size:1rem;">{filename}</div></div>',
+            unsafe_allow_html=True
+        )
 
 
 def render_export_section(df: pd.DataFrame, dataset_key: str, upload_meta: dict | None):
     cfg = DATASETS[dataset_key]
     st.subheader("Export")
+
     if df.empty:
         st.warning("No data available for export.")
         return
@@ -493,7 +481,7 @@ def render_admin_upload_section(dataset_key: str):
         uploaded_file = st.file_uploader(
             f"Upload Excel for {cfg['label']}",
             type=["xlsx", "xls"],
-            key=f"uploader_{dataset_key}",
+            key=f"uploader_{dataset_key}"
         )
         submitted = st.form_submit_button("Upload and Replace")
 
@@ -501,19 +489,133 @@ def render_admin_upload_section(dataset_key: str):
             if not uploaded_file:
                 st.error("Please select an Excel file first.")
             else:
-                ok, msg = upload_dataset(dataset_key, uploaded_file, st.session_state.admin_user or current_admin_name())
+                ok, msg = upload_dataset(
+                    dataset_key,
+                    uploaded_file,
+                    st.session_state.admin_user or current_admin_name()
+                )
                 if ok:
                     st.success(msg)
+                    st.rerun()
                 else:
                     st.error(msg)
 
 
+def admin_sidebar():
+    with st.sidebar:
+        st.title("Control Panel")
+        st.caption("Production dashboard")
+
+        if st.session_state.admin_logged_in:
+            st.success(f"Admin logged in: {st.session_state.admin_user}")
+            if st.button("Logout", use_container_width=True):
+                st.session_state.admin_logged_in = False
+                st.session_state.admin_user = ""
+                st.rerun()
+        else:
+            st.markdown("### Admin Login")
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+
+            if st.button("Login", use_container_width=True):
+                user_ok = safe_equal(username, st.secrets["ADMIN_USERNAME"])
+                pw_ok = safe_equal(sha256_text(password), st.secrets["ADMIN_PASSWORD_HASH"])
+
+                if user_ok and pw_ok:
+                    st.session_state.admin_logged_in = True
+                    st.session_state.admin_user = current_admin_name()
+                    st.success("Admin login successful.")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+
+        st.divider()
+        st.markdown("### Navigation")
+
+        if st.button("🏠 Home", use_container_width=True):
+            st.session_state.page = "home"
+            st.rerun()
+
+        if st.button("📦 Order Dashboard", use_container_width=True):
+            st.session_state.page = "order_dashboard"
+            st.rerun()
+
+        if st.button("🚚 FBB-Shipment Details", use_container_width=True):
+            st.session_state.page = "fbb_shipment_details"
+            st.rerun()
+
+        if st.button("🧾 FBB Invoice Status", use_container_width=True):
+            st.session_state.page = "fbb_invoice_status"
+            st.rerun()
+
+
+# =========================================================
+# HOME PAGE
+# =========================================================
+def home_page():
+    render_page_header("Operations Dashboard", "Select a dashboard.")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown("""
+        <div class="card">
+            <div>
+                <h3 style="margin-bottom:10px;">Order Dashboard</h3>
+                <p style="margin:0;">Order KPIs, weekly view, open orders, duplicate checker.</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open Order Dashboard", key="go_order", use_container_width=True):
+            st.session_state.page = "order_dashboard"
+            st.rerun()
+
+    with c2:
+        st.markdown("""
+        <div class="card">
+            <div>
+                <h3 style="margin-bottom:10px;">FBB-Shipment Details</h3>
+                <p style="margin:0;">Shipment references, weekly shipment analysis, tracking overview.</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open FBB-Shipment Details", key="go_ship", use_container_width=True):
+            st.session_state.page = "fbb_shipment_details"
+            st.rerun()
+
+    with c3:
+        st.markdown("""
+        <div class="card">
+            <div>
+                <h3 style="margin-bottom:10px;">FBB Invoice Status</h3>
+                <p style="margin:0;">Invoice progress, remaining quantity, status/team analysis.</p>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+        if st.button("Open FBB Invoice Status", key="go_invoice", use_container_width=True):
+            st.session_state.page = "fbb_invoice_status"
+            st.rerun()
+
+    st.divider()
+    st.info("Viewer mode can analyze and export. Only admin can upload and replace data.")
+
+
+# =========================================================
+# ORDER DASHBOARD PAGE
+# =========================================================
 def page_order_dashboard():
-    st.markdown('<div class="page-title">Order Dashboard</div>', unsafe_allow_html=True)
+    render_page_header("Order Dashboard", "Order-level summary, week analysis, open lines and duplicate check.")
+
     df, upload_meta = load_dataset_df("order_dashboard")
-    st.caption(f"Loaded rows in dashboard: {len(df):,}")
+
+    # Debug line to confirm full load
+    if upload_meta:
+        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {int(upload_meta.get('row_count', 0)):,}")
+
     render_last_updated(upload_meta)
+    st.markdown("<br>", unsafe_allow_html=True)
     render_admin_upload_section("order_dashboard")
+    st.markdown("<br>", unsafe_allow_html=True)
     render_export_section(df, "order_dashboard", upload_meta)
     st.divider()
 
@@ -538,7 +640,11 @@ def page_order_dashboard():
         work[cdd_col] = parse_date_series(work[cdd_col])
 
     total_orders = work[order_col].nunique() if order_col else len(work)
-    status_series = work[status_col].astype(str).str.strip().str.lower() if status_col else pd.Series([], dtype="object")
+
+    status_series = (
+        work[status_col].astype(str).str.strip().str.lower()
+        if status_col else pd.Series([], dtype="object")
+    )
 
     open_count = int(status_series.str.contains("open", na=False).sum()) if status_col else 0
     shipped_count = int(status_series.str.contains("ship", na=False).sum()) if status_col else 0
@@ -557,6 +663,7 @@ def page_order_dashboard():
             .reset_index(name="Orders")
             .sort_values(by=batch_col)
         )
+
         if status_col:
             week_status = (
                 work.groupby(batch_col)[status_col]
@@ -570,7 +677,7 @@ def page_order_dashboard():
         st.plotly_chart(fig, use_container_width=True)
 
         if "Week State" in weekly.columns:
-            st.dataframe(weekly, use_container_width=True)
+            st.dataframe(weekly, use_container_width=True, height=260)
 
     st.subheader("Open Orders")
     if status_col:
@@ -580,7 +687,7 @@ def page_order_dashboard():
 
     open_cols = [c for c in [order_col, date_col, material_col, status_col, batch_col, club_col, type_col, cdd_col] if c]
     if open_cols:
-        st.dataframe(open_df[open_cols], use_container_width=True, height=350)
+        st.dataframe(open_df[open_cols], use_container_width=True, height=360)
 
     st.subheader("Duplicate Line Checker")
     if order_col and material_col:
@@ -588,21 +695,31 @@ def page_order_dashboard():
         dup_df["dup_key"] = dup_df[order_col].astype(str).str.strip() + "||" + dup_df[material_col].astype(str).str.strip()
         dup_df["dup_count"] = dup_df.groupby("dup_key")["dup_key"].transform("count")
         duplicates = dup_df[dup_df["dup_count"] > 1].copy()
+
         if duplicates.empty:
             st.success("No duplicate order + material combinations found.")
         else:
             show_cols = [c for c in [order_col, material_col, batch_col, status_col, date_col, club_col] if c] + ["dup_count"]
             st.warning(f"Found {len(duplicates):,} duplicate lines.")
-            st.dataframe(duplicates[show_cols], use_container_width=True, height=320)
+            st.dataframe(duplicates[show_cols], use_container_width=True, height=340)
     else:
         st.info("Duplicate checker needs both 'BC Order/SalesDocument' and 'MaterialNumber' columns.")
 
 
+# =========================================================
+# SHIPMENT PAGE
+# =========================================================
 def page_fbb_shipment_details():
-    st.markdown('<div class="page-title">FBB-Shipment Details</div>', unsafe_allow_html=True)
+    render_page_header("FBB-Shipment Details", "Shipment summary, weekly shipped quantity and tracking visibility.")
+
     df, upload_meta = load_dataset_df("fbb_shipment_details")
+    if upload_meta:
+        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {int(upload_meta.get('row_count', 0)):,}")
+
     render_last_updated(upload_meta)
+    st.markdown("<br>", unsafe_allow_html=True)
     render_admin_upload_section("fbb_shipment_details")
+    st.markdown("<br>", unsafe_allow_html=True)
     render_export_section(df, "fbb_shipment_details", upload_meta)
     st.divider()
 
@@ -651,19 +768,28 @@ def page_fbb_shipment_details():
 
     st.subheader("Shipment Detail Table")
     show_cols = [c for c in [sales_doc_col, order_col, sku_col, qty_col, week_col, date_col, code_col, ship_ref_col, ups_col] if c]
-    st.dataframe(work[show_cols], use_container_width=True, height=380)
+    st.dataframe(work[show_cols], use_container_width=True, height=400)
 
     if ups_col:
         st.subheader("Rows Missing UPS Tracking")
         missing = work[work[ups_col].isna() | (work[ups_col].astype(str).str.strip() == "")]
-        st.dataframe(missing[show_cols], use_container_width=True, height=280)
+        st.dataframe(missing[show_cols], use_container_width=True, height=300)
 
 
+# =========================================================
+# INVOICE PAGE
+# =========================================================
 def page_fbb_invoice_status():
-    st.markdown('<div class="page-title">FBB Invoice Status</div>', unsafe_allow_html=True)
+    render_page_header("FBB Invoice Status", "Invoice progress, remaining quantity and team/status analysis.")
+
     df, upload_meta = load_dataset_df("fbb_invoice_status")
+    if upload_meta:
+        st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {int(upload_meta.get('row_count', 0)):,}")
+
     render_last_updated(upload_meta)
+    st.markdown("<br>", unsafe_allow_html=True)
     render_admin_upload_section("fbb_invoice_status")
+    st.markdown("<br>", unsafe_allow_html=True)
     render_export_section(df, "fbb_invoice_status", upload_meta)
     st.divider()
 
@@ -688,15 +814,8 @@ def page_fbb_invoice_status():
     team_col = first_existing_column(work, ["Team"])
 
     numeric_cols = [
-        num_orders_col,
-        num_invoiced_col,
-        rem_orders_col,
-        total_qty_col,
-        total_amount_col,
-        invoiced_qty_col,
-        rem_qty_col,
-        rem_amt_col,
-        days_col,
+        num_orders_col, num_invoiced_col, rem_orders_col, total_qty_col,
+        total_amount_col, invoiced_qty_col, rem_qty_col, rem_amt_col, days_col
     ]
     for c in [x for x in numeric_cols if x]:
         work[c] = parse_numeric_series(work[c])
@@ -740,6 +859,9 @@ def page_fbb_invoice_status():
     st.dataframe(work, use_container_width=True, height=420)
 
 
+# =========================================================
+# MAIN
+# =========================================================
 def main():
     init_state()
     admin_sidebar()

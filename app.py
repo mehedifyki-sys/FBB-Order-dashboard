@@ -1,405 +1,762 @@
 import io
-import numpy as np
+import hashlib
+import hmac
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
-from supabase import create_client
+from supabase import create_client, Client
+
 
 st.set_page_config(
-    page_title="FBB Order Command Center",
+    page_title="Operations Dashboard",
+    page_icon="📊",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-st.markdown("""
+
+DATASETS = {
+    "order_dashboard": {
+        "label": "Order Dashboard",
+        "rows_table": "order_dashboard_rows",
+        "download_name": "Order_Dashboard.xlsx",
+        "expected_headers": [
+            "BC Order",
+            "MaterialNumber",
+            "BatchNumber",
+            "Order Status",
+            "Status",
+            "OrderDate",
+            "BC Order Date",
+            "CDD",
+            "ClubName",
+            "OrderType",
+            "SalesDocument",
+        ],
+    },
+    "fbb_shipment_details": {
+        "label": "FBB-Shipment Details",
+        "rows_table": "fbb_shipment_details_rows",
+        "download_name": "FBB_Shipment_Details.xlsx",
+        "expected_headers": [
+            "Sales Doc",
+            "ORDER #",
+            "SKU/ ITEM #",
+            "Order qty",
+            "WEEK",
+            "DATE",
+            "Code",
+            "Shipment Ref#",
+            "UPS TRACKING # (NO SPACE)",
+        ],
+    },
+    "fbb_invoice_status": {
+        "label": "FBB Invoice Status",
+        "rows_table": "fbb_invoice_status_rows",
+        "download_name": "FBB_Invoice_Status.xlsx",
+        "expected_headers": [
+            "SP#",
+            "BD Ref#",
+            "CS Ref#",
+            "Number of Orders",
+            "Number of Invoiced Orders",
+            "Remaining Orders to Invoice",
+            "Total Qty Shipped",
+            "Total Amount",
+            "Invoiced Qty",
+            "Remaining Qty to invoice",
+            "Remaining Amount to invoice",
+            "Hand Over",
+            "UPS Pickup Date",
+            "#Days",
+            "Status",
+            "Team",
+        ],
+    },
+}
+
+
+st.markdown(
+    """
 <style>
-.stApp {background: linear-gradient(180deg, #08101d 0%, #0b1220 100%); color: #E5E7EB;}
-.block-container {padding-top: 1.2rem; padding-bottom: 1rem;}
-.main-title {font-size: 2rem; font-weight: 800; color: white; margin-bottom: 0.25rem;}
-.sub-title {color: #94A3B8; font-size: 0.95rem; margin-bottom: 1rem;}
-.kpi-card {background: linear-gradient(180deg, #111827 0%, #0f172a 100%); padding: 18px; border-radius: 18px; border: 1px solid #22304a;}
-.kpi-label {font-size: 0.88rem; color: #A5B4FC; font-weight: 700; margin-bottom: 6px;}
-.kpi-value {font-size: 2rem; font-weight: 800; color: #F8FAFC; line-height: 1.05;}
-.small-note {font-size: 0.8rem; color: #94A3B8; margin-top: 8px;}
-.section-card {background: linear-gradient(180deg, #111827 0%, #0f172a 100%); padding: 16px 16px 8px 16px; border-radius: 18px; border: 1px solid #22304a;}
-.section-title {font-size: 1.05rem; font-weight: 800; color: #F8FAFC; margin-bottom: 8px;}
-.status-pill-open {display:inline-block; padding:4px 10px; border-radius:999px; background:rgba(245,158,11,0.15); color:#FBBF24; font-weight:700; font-size:0.78rem; margin:2px 4px 2px 0;}
-.status-pill-closed {display:inline-block; padding:4px 10px; border-radius:999px; background:rgba(34,197,94,0.15); color:#4ADE80; font-weight:700; font-size:0.78rem; margin:2px 4px 2px 0;}
-div[data-testid="stDataFrame"] {border: 1px solid #22304a; border-radius: 14px; overflow: hidden;}
+.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
+.card {
+    border: 1px solid rgba(120,120,120,0.25);
+    border-radius: 18px;
+    padding: 18px;
+    background: rgba(255,255,255,0.03);
+    min-height: 130px;
+}
+.metric-card {
+    border: 1px solid rgba(120,120,120,0.2);
+    border-radius: 16px;
+    padding: 14px 16px;
+    background: rgba(255,255,255,0.03);
+}
+.small-muted {color: #9aa0a6; font-size: 0.92rem;}
+.big-number {font-size: 1.8rem; font-weight: 700; margin-top: 4px;}
+.page-title {font-size: 1.9rem; font-weight: 800; margin-bottom: 0.35rem;}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-SUPABASE_URL = st.secrets["SUPABASE_URL"]
-SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
-client = create_client(SUPABASE_URL, SUPABASE_KEY)
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
 
-def first_nonblank(series):
-    for value in series:
-        if pd.notna(value) and str(value).strip():
-            return value
+
+def safe_equal(a: str, b: str) -> bool:
+    return hmac.compare_digest(a or "", b or "")
+
+
+def init_state():
+    if "page" not in st.session_state:
+        st.session_state.page = "home"
+    if "admin_logged_in" not in st.session_state:
+        st.session_state.admin_logged_in = False
+    if "admin_user" not in st.session_state:
+        st.session_state.admin_user = ""
+
+
+@st.cache_resource
+def get_supabase() -> Client:
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+
+
+def normalize_value_for_json(value):
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    return value
+
+
+def dataframe_to_records(df: pd.DataFrame):
+    records = []
+    for i, row in df.iterrows():
+        row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
+        records.append({"row_number": int(i) + 1, "row_data": row_dict})
+    return records
+
+
+def first_existing_column(df: pd.DataFrame, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
     return None
 
-def categorize_order(order_statuses, workflow_statuses):
-    status_order = " | ".join([str(x).strip() for x in order_statuses if str(x).strip()])
-    status_flow = " | ".join([str(x).strip() for x in workflow_statuses if str(x).strip()])
-    combined = f"{status_order} || {status_flow}".lower()
 
-    if "cancel" in combined:
-        return "Cancelled"
-    if "switched to pa" in combined:
-        return "Switched to PA"
-    if "open" in combined or "pending" in combined or "backorder" in combined:
-        return "Open Still"
-    if "shipped" in combined or "complete" in combined or "delivered" in combined:
-        return "Shipped"
-    return "Other"
+def parse_date_series(series: pd.Series) -> pd.Series:
+    return pd.to_datetime(series, errors="coerce")
 
-def week_status_from_categories(categories):
-    categories = [str(x).strip() for x in categories if str(x).strip()]
-    if not categories:
-        return "Unknown"
-    non_closed = [x for x in categories if x not in ["Shipped", "Cancelled", "Switched to PA"]]
-    return "Open" if len(non_closed) > 0 else "Closed"
 
-def to_excel_bytes(dataframe):
-    bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-        dataframe.to_excel(writer, index=False, sheet_name="Analyzer")
-    bio.seek(0)
-    return bio.getvalue()
+def parse_numeric_series(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
 
-def metric_block(label, value, note=""):
-    st.markdown(
-        f"<div class='kpi-card'><div class='kpi-label'>{label}</div><div class='kpi-value'>{value:,}</div><div class='small-note'>{note}</div></div>",
-        unsafe_allow_html=True
+
+def current_admin_name():
+    return st.secrets.get("ADMIN_DISPLAY_NAME", st.secrets.get("ADMIN_USERNAME", "Admin"))
+
+
+def render_last_updated(upload_meta: dict | None):
+    st.subheader("Last Updated")
+    if not upload_meta:
+        st.info("No upload found yet.")
+        return
+
+    uploaded_by = upload_meta.get("uploaded_by", "-")
+    uploaded_at = upload_meta.get("uploaded_at", "")
+    row_count = upload_meta.get("row_count", 0)
+    filename = upload_meta.get("original_filename", "-")
+
+    try:
+        dt = pd.to_datetime(uploaded_at)
+        uploaded_at_fmt = dt.strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        uploaded_at_fmt = str(uploaded_at)
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(
+            '<div class="metric-card"><div class="small-muted">Updated by</div><div class="big-number" style="font-size:1.1rem;">{}</div></div>'.format(uploaded_by),
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            '<div class="metric-card"><div class="small-muted">Updated at</div><div class="big-number" style="font-size:1.1rem;">{}</div></div>'.format(uploaded_at_fmt),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            '<div class="metric-card"><div class="small-muted">Rows</div><div class="big-number">{}</div></div>'.format(row_count),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            '<div class="metric-card"><div class="small-muted">Source file</div><div class="big-number" style="font-size:1.0rem;">{}</div></div>'.format(filename),
+            unsafe_allow_html=True,
+        )
+
+
+def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31] if sheet_name else "Data")
+    output.seek(0)
+    return output.getvalue()
+
+
+def batched(seq, size=500):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def set_old_uploads_inactive(sb: Client, dataset_key: str, new_upload_id: int):
+    existing = (
+        sb.table("app_uploads")
+        .select("id")
+        .eq("dataset_key", dataset_key)
+        .eq("is_active", True)
+        .neq("id", new_upload_id)
+        .execute()
     )
+    old_ids = [r["id"] for r in (existing.data or [])]
 
-@st.cache_data(ttl=300)
-def load_data():
-    response = client.table("order_data").select("*").execute()
-    data = response.data or []
-    df = pd.DataFrame(data)
+    if old_ids:
+        sb.table("app_uploads").update({"is_active": False}).in_("id", old_ids).execute()
+    return old_ids
+
+
+def delete_old_rows(sb: Client, rows_table: str, old_upload_ids: list[int]):
+    if old_upload_ids:
+        sb.table(rows_table).delete().in_("upload_id", old_upload_ids).execute()
+
+
+def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
+    cfg = DATASETS[dataset_key]
+    sb = get_supabase()
+
+    try:
+        excel = pd.ExcelFile(uploaded_file)
+        sheet_name = excel.sheet_names[0]
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+    except Exception as e:
+        return False, f"Could not read Excel file: {e}"
+
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all").reset_index(drop=True)
 
     if df.empty:
-        return None, None, None
+        return False, "Uploaded file is empty after removing blank rows."
 
-    for col in ["bc_order", "material_number", "batch_number", "order_status", "workflow_status", "club_name", "order_type", "sales_document"]:
-        if col in df.columns:
-            df[col] = df[col].fillna("").astype(str).str.strip()
+    upload_payload = {
+        "dataset_key": dataset_key,
+        "original_filename": uploaded_file.name,
+        "uploaded_by": admin_name,
+        "row_count": int(len(df)),
+        "column_order": list(df.columns),
+        "sheet_name": sheet_name,
+        "is_active": True,
+    }
 
-    for col in ["order_date", "cdd", "uploaded_at"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
+    try:
+        upload_resp = sb.table("app_uploads").insert(upload_payload).execute()
+        upload_id = upload_resp.data[0]["id"]
 
-    df["Month"] = df["order_date"].dt.strftime("%B")
-    df["Year"] = df["order_date"].dt.year
-    df["ISO Week"] = df["order_date"].dt.isocalendar().week.astype("Int64")
-    df["Year-Week"] = (
-        df["order_date"].dt.isocalendar().year.astype("Int64").astype(str)
-        + "-W"
-        + df["ISO Week"].astype("Int64").astype(str).str.zfill(2)
-    )
+        records = dataframe_to_records(df)
+        for chunk in batched(records, 500):
+            payload = [
+                {"upload_id": upload_id, "row_number": item["row_number"], "row_data": item["row_data"]}
+                for item in chunk
+            ]
+            sb.table(cfg["rows_table"]).insert(payload).execute()
 
-    dup = (
-        df.groupby(["bc_order", "material_number"])["batch_number"]
-        .nunique(dropna=True)
-        .reset_index(name="Batch Count")
-    )
-    dup["Is Duplicate"] = dup["Batch Count"] > 1
-
-    df = df.merge(
-        dup[["bc_order", "material_number", "Batch Count", "Is Duplicate"]],
-        on=["bc_order", "material_number"],
-        how="left"
-    )
-    df["Is Duplicate"] = df["Is Duplicate"].fillna(False)
-    df["Duplicate Flag"] = np.where(df["Is Duplicate"], "Duplicate", "Unique")
-
-    orders = (
-        df.groupby("bc_order")
-        .agg(
-            OrderDate=("order_date", "min"),
-            ClubName=("club_name", first_nonblank),
-            OrderType=("order_type", first_nonblank),
-            SalesDocument=("sales_document", first_nonblank),
-            AnyOrderStatus=("order_status", lambda s: list(s)),
-            AnyWorkflowStatus=("workflow_status", lambda s: list(s)),
-            DuplicateLines=("Is Duplicate", "sum"),
-            TotalLines=("material_number", "size")
+                # verify inserted row count
+        verify_resp = (
+            sb.table(cfg["rows_table"])
+            .select("id", count="exact")
+            .eq("upload_id", upload_id)
+            .execute()
         )
-        .reset_index()
-    )
 
-    orders["Order Category"] = orders.apply(
-        lambda r: categorize_order(r["AnyOrderStatus"], r["AnyWorkflowStatus"]),
-        axis=1
-    )
+        inserted_count = verify_resp.count if hasattr(verify_resp, "count") else None
 
-    orders["Month"] = orders["OrderDate"].dt.strftime("%B")
-    orders["Year"] = orders["OrderDate"].dt.year
-    orders["ISO Week"] = orders["OrderDate"].dt.isocalendar().week.astype("Int64")
-    orders["Year-Week"] = (
-        orders["OrderDate"].dt.isocalendar().year.astype("Int64").astype(str)
-        + "-W"
-        + orders["ISO Week"].astype("Int64").astype(str).str.zfill(2)
-    )
-    orders["Has Duplicate"] = np.where(orders["DuplicateLines"] > 0, "Yes", "No")
+        if inserted_count is not None and inserted_count != len(df):
+            return False, f"Upload mismatch: expected {len(df)} rows but found {inserted_count} rows in database."
 
-    df = df.merge(
-        orders[["bc_order", "Order Category"]],
-        on="bc_order",
-        how="left"
-    )
+        old_upload_ids = set_old_uploads_inactive(sb, dataset_key, upload_id)
+        delete_old_rows(sb, cfg["rows_table"], old_upload_ids)
 
-    weekly_status = (
-        orders.groupby("Year-Week")
-        .agg(
-            ISO_Week=("ISO Week", "min"),
-            Orders_Received=("bc_order", "count"),
-            Pending_to_Ship=("Order Category", lambda s: int((s == "Open Still").sum())),
-            Week_Status=("Order Category", lambda s: week_status_from_categories(list(s)))
+        clear_caches()
+        return True, f"{cfg['label']} uploaded successfully."
+    except Exception as e:
+        return False, f"Upload failed: {e}"
+
+
+def clear_caches():
+    load_active_upload_meta.clear()
+    load_dataset_df.clear()
+
+
+@st.cache_data(ttl=60)
+def load_active_upload_meta(dataset_key: str):
+    sb = get_supabase()
+    resp = (
+        sb.table("app_uploads")
+        .select("*")
+        .eq("dataset_key", dataset_key)
+        .eq("is_active", True)
+        .order("uploaded_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if not resp.data:
+        return None
+    return resp.data[0]
+
+
+@st.cache_data(ttl=60)
+def load_dataset_df(dataset_key: str):
+    cfg = DATASETS[dataset_key]
+    upload_meta = load_active_upload_meta(dataset_key)
+
+    if not upload_meta:
+        return pd.DataFrame(), None
+
+    sb = get_supabase()
+    upload_id = upload_meta["id"]
+    expected_rows = int(upload_meta.get("row_count", 0))
+
+    all_rows = []
+    page_size = 500
+    start = 0
+
+    while start < expected_rows:
+        end = min(start + page_size - 1, expected_rows - 1)
+
+        resp = (
+            sb.table(cfg["rows_table"])
+            .select("row_number,row_data")
+            .eq("upload_id", upload_id)
+            .order("row_number")
+            .range(start, end)
+            .execute()
         )
-        .reset_index()
-        .sort_values(["ISO_Week", "Year-Week"])
+
+        batch = resp.data or []
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        start += page_size
+
+    records = [r["row_data"] for r in all_rows]
+    df = pd.DataFrame(records)
+
+    column_order = upload_meta.get("column_order", []) or []
+    ordered_cols = [c for c in column_order if c in df.columns]
+    extra_cols = [c for c in df.columns if c not in ordered_cols]
+
+    if len(df.columns) > 0:
+        df = df[ordered_cols + extra_cols]
+    else:
+        df = pd.DataFrame(columns=column_order)
+
+    return df, upload_meta
+
+
+def admin_sidebar():
+    with st.sidebar:
+        st.title("Control Panel")
+        st.caption("Production dashboard")
+
+        if st.session_state.admin_logged_in:
+            st.success(f"Admin logged in: {st.session_state.admin_user}")
+            if st.button("Logout", use_container_width=True):
+                st.session_state.admin_logged_in = False
+                st.session_state.admin_user = ""
+                st.rerun()
+        else:
+            st.markdown("### Admin Login")
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            if st.button("Login", use_container_width=True):
+                user_ok = safe_equal(username, st.secrets["ADMIN_USERNAME"])
+                pw_ok = safe_equal(sha256_text(password), st.secrets["ADMIN_PASSWORD_HASH"])
+                if user_ok and pw_ok:
+                    st.session_state.admin_logged_in = True
+                    st.session_state.admin_user = current_admin_name()
+                    st.success("Admin login successful.")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password.")
+
+        st.divider()
+        st.markdown("### Navigation")
+        if st.button("🏠 Home", use_container_width=True):
+            st.session_state.page = "home"
+            st.rerun()
+        if st.button("📦 Order Dashboard", use_container_width=True):
+            st.session_state.page = "order_dashboard"
+            st.rerun()
+        if st.button("🚚 FBB-Shipment Details", use_container_width=True):
+            st.session_state.page = "fbb_shipment_details"
+            st.rerun()
+        if st.button("🧾 FBB Invoice Status", use_container_width=True):
+            st.session_state.page = "fbb_invoice_status"
+            st.rerun()
+
+
+def home_page():
+    st.markdown('<div class="page-title">Operations Dashboard</div>', unsafe_allow_html=True)
+    st.write("Select a dashboard.")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.markdown(
+            """
+        <div class="card">
+            <h3>Order Dashboard</h3>
+            <p>Order KPIs, weekly view, open orders, duplicate checker.</p>
+        </div>
+        """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open Order Dashboard", key="go_order", use_container_width=True):
+            st.session_state.page = "order_dashboard"
+            st.rerun()
+
+    with c2:
+        st.markdown(
+            """
+        <div class="card">
+            <h3>FBB-Shipment Details</h3>
+            <p>Shipment references, weekly shipment analysis, tracking overview.</p>
+        </div>
+        """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open FBB-Shipment Details", key="go_ship", use_container_width=True):
+            st.session_state.page = "fbb_shipment_details"
+            st.rerun()
+
+    with c3:
+        st.markdown(
+            """
+        <div class="card">
+            <h3>FBB Invoice Status</h3>
+            <p>Invoice progress, remaining quantity, status/team analysis.</p>
+        </div>
+        """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open FBB Invoice Status", key="go_invoice", use_container_width=True):
+            st.session_state.page = "fbb_invoice_status"
+            st.rerun()
+
+    st.divider()
+    st.info("Viewer mode can analyze and export. Only admin can upload and replace data.")
+
+
+def render_export_section(df: pd.DataFrame, dataset_key: str, upload_meta: dict | None):
+    cfg = DATASETS[dataset_key]
+    st.subheader("Export")
+    if df.empty:
+        st.warning("No data available for export.")
+        return
+
+    sheet_name = upload_meta.get("sheet_name", cfg["label"]) if upload_meta else cfg["label"]
+    file_name = upload_meta.get("original_filename", cfg["download_name"]) if upload_meta else cfg["download_name"]
+    data = excel_bytes_from_df(df, sheet_name)
+
+    st.download_button(
+        label="⬇️ Download current dataset",
+        data=data,
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
     )
 
-    return df, orders, weekly_status
 
-st.markdown("""
-<div style='font-size: 2rem; font-weight: 800; color: white; margin-left: 5px;'>
-FBB Order Command Center
-</div>
-""", unsafe_allow_html=True)
-st.markdown("<div class='sub-title'>Centralized database view. Only admin updates data.</div>", unsafe_allow_html=True)
+def render_admin_upload_section(dataset_key: str):
+    if not st.session_state.admin_logged_in:
+        return
 
-df, orders, weekly_status = load_data()
+    cfg = DATASETS[dataset_key]
+    st.subheader("Admin Upload")
+    st.caption("Upload Excel to replace the active dataset for this page.")
 
-if df is None or orders is None or weekly_status is None:
-    st.warning("No data found in Supabase table `order_data`.")
-    st.stop()
-
-with st.sidebar:
-    st.header("SAP-Style Filters")
-    page = st.radio("View", ["Dashboard", "Analyzer"], index=0)
-
-    clubs = ["All"] + sorted([x for x in orders["ClubName"].dropna().astype(str).unique().tolist() if x.strip()])
-    months_sorted = ["January","February","March","April","May","June","July","August","September","October","November","December"]
-    months = ["All"] + [m for m in months_sorted if m in set(orders["Month"].dropna())]
-    order_types = ["All"] + sorted([x for x in orders["OrderType"].dropna().astype(str).unique().tolist() if x.strip()])
-    year_weeks = ["All"] + sorted([x for x in orders["Year-Week"].dropna().astype(str).unique().tolist() if x.strip()])
-
-    selected_club = st.selectbox("Club", clubs, index=0)
-    selected_month = st.selectbox("Month", months, index=0)
-    selected_order_type = st.selectbox("Order Type", order_types, index=0)
-    selected_year_week = st.selectbox("Week", year_weeks, index=0)
-
-    if st.button("Refresh Data"):
-        st.cache_data.clear()
-        st.rerun()
-
-orders_f = orders.copy()
-if selected_club != "All":
-    orders_f = orders_f[orders_f["ClubName"] == selected_club]
-if selected_month != "All":
-    orders_f = orders_f[orders_f["Month"] == selected_month]
-if selected_order_type != "All":
-    orders_f = orders_f[orders_f["OrderType"] == selected_order_type]
-if selected_year_week != "All":
-    orders_f = orders_f[orders_f["Year-Week"] == selected_year_week]
-
-df_f = df[df["bc_order"].isin(orders_f["bc_order"])].copy()
-weekly_status_f = weekly_status.copy()
-if selected_year_week != "All":
-    weekly_status_f = weekly_status_f[weekly_status_f["Year-Week"] == selected_year_week]
-
-if page == "Dashboard":
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    with c1: metric_block("Total Orders", len(orders_f), "Distinct orders")
-    with c2: metric_block("Shipped", int((orders_f["Order Category"] == "Shipped").sum()), "Distinct orders")
-    with c3: metric_block("Open Still", int((orders_f["Order Category"] == "Open Still").sum()), "Distinct orders")
-    with c4: metric_block("Cancelled", int((orders_f["Order Category"] == "Cancelled").sum()), "Distinct orders")
-    with c5: metric_block("Switched to PA", int((orders_f["Order Category"] == "Switched to PA").sum()), "Distinct orders")
-    with c6: metric_block("Duplicate Orders", int((orders_f["Has Duplicate"] == "Yes").sum()), "Same order + material + different batch")
-
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-
-    c7, c8, c9 = st.columns(3)
-    with c7: metric_block("Open Weeks", int((weekly_status_f["Week_Status"] == "Open").sum()) if len(weekly_status_f) else 0, "Weeks not fully closed")
-    with c8: metric_block("Closed Weeks", int((weekly_status_f["Week_Status"] == "Closed").sum()) if len(weekly_status_f) else 0, "Weeks fully completed")
-    with c9: metric_block("Pending to Ship", int((orders_f["Order Category"] == "Open Still").sum()), "Open orders still pending")
-
-    left, right = st.columns([1.2, 1])
-
-    with left:
-        st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>Weekly Orders Received vs Pending to Ship</div>", unsafe_allow_html=True)
-        weekly_chart = (
-            orders_f.groupby("Year-Week")
-            .agg(
-                Orders_Received=("bc_order", "count"),
-                Pending_to_Ship=("Order Category", lambda s: int((s == "Open Still").sum()))
-            )
-            .reset_index()
+    with st.form(f"upload_form_{dataset_key}", clear_on_submit=True):
+        uploaded_file = st.file_uploader(
+            f"Upload Excel for {cfg['label']}",
+            type=["xlsx", "xls"],
+            key=f"uploader_{dataset_key}",
         )
-        fig = go.Figure()
-        fig.add_bar(x=weekly_chart["Year-Week"], y=weekly_chart["Orders_Received"], name="Orders Received")
-        fig.add_scatter(x=weekly_chart["Year-Week"], y=weekly_chart["Pending_to_Ship"], name="Pending to Ship", mode="lines+markers", yaxis="y2")
-        fig.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            yaxis=dict(title="Orders"),
-            yaxis2=dict(title="Pending", overlaying="y", side="right"),
-            legend=dict(orientation="h", y=1.1),
-            height=420,
-            margin=dict(l=20, r=20, t=20, b=20)
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        submitted = st.form_submit_button("Upload and Replace")
 
-    with right:
-        st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>Order Status Split</div>", unsafe_allow_html=True)
-        status_counts = orders_f["Order Category"].value_counts().reindex(["Shipped", "Open Still", "Cancelled", "Switched to PA", "Other"], fill_value=0).reset_index()
-        status_counts.columns = ["Category", "Orders"]
-        fig2 = px.pie(status_counts, names="Category", values="Orders", hole=0.58)
-        fig2.update_layout(
-            template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            height=420,
-            margin=dict(l=20, r=20, t=20, b=20)
-        )
-        st.plotly_chart(fig2, use_container_width=True)
-        st.markdown("</div>", unsafe_allow_html=True)
+        if submitted:
+            if not uploaded_file:
+                st.error("Please select an Excel file first.")
+            else:
+                ok, msg = upload_dataset(dataset_key, uploaded_file, st.session_state.admin_user or current_admin_name())
+                if ok:
+                    st.success(msg)
+                else:
+                    st.error(msg)
 
-    bottom_left, bottom_right = st.columns([1.1, 0.9])
 
-    with bottom_left:
-        st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>Top Clubs by Orders</div>", unsafe_allow_html=True)
-        clubs_df = (
-            orders_f.groupby("ClubName")["bc_order"]
-            .count()
+def page_order_dashboard():
+    st.markdown('<div class="page-title">Order Dashboard</div>', unsafe_allow_html=True)
+    df, upload_meta = load_dataset_df("order_dashboard")
+    st.caption(f"Loaded rows in dashboard: {len(df):,}")
+    render_last_updated(upload_meta)
+    render_admin_upload_section("order_dashboard")
+    render_export_section(df, "order_dashboard", upload_meta)
+    st.divider()
+
+    if df.empty:
+        st.warning("No Order Dashboard data uploaded yet.")
+        return
+
+    order_col = first_existing_column(df, ["BC Order", "SalesDocument"])
+    material_col = first_existing_column(df, ["MaterialNumber"])
+    batch_col = first_existing_column(df, ["BatchNumber"])
+    status_col = first_existing_column(df, ["Order Status", "Status"])
+    date_col = first_existing_column(df, ["OrderDate", "BC Order Date"])
+    club_col = first_existing_column(df, ["ClubName"])
+    cdd_col = first_existing_column(df, ["CDD"])
+    type_col = first_existing_column(df, ["OrderType"])
+
+    work = df.copy()
+
+    if date_col:
+        work[date_col] = parse_date_series(work[date_col])
+    if cdd_col:
+        work[cdd_col] = parse_date_series(work[cdd_col])
+
+    total_orders = work[order_col].nunique() if order_col else len(work)
+    status_series = work[status_col].astype(str).str.strip().str.lower() if status_col else pd.Series([], dtype="object")
+
+    open_count = int(status_series.str.contains("open", na=False).sum()) if status_col else 0
+    shipped_count = int(status_series.str.contains("ship", na=False).sum()) if status_col else 0
+    cancel_count = int(status_series.str.contains("cancel", na=False).sum()) if status_col else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Orders", f"{total_orders:,}")
+    c2.metric("Open Lines", f"{open_count:,}")
+    c3.metric("Shipped Lines", f"{shipped_count:,}")
+    c4.metric("Cancelled Lines", f"{cancel_count:,}")
+
+    if batch_col and order_col:
+        weekly = (
+            work.groupby(batch_col, dropna=False)[order_col]
+            .nunique()
             .reset_index(name="Orders")
-            .sort_values("Orders", ascending=False)
-            .head(10)
+            .sort_values(by=batch_col)
         )
-        if len(clubs_df) > 0:
-            fig3 = px.bar(clubs_df, x="Orders", y="ClubName", orientation="h")
-            fig3.update_layout(
-                template="plotly_dark",
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                yaxis={"categoryorder": "total ascending"},
-                height=400,
-                margin=dict(l=20, r=20, t=20, b=20)
+        if status_col:
+            week_status = (
+                work.groupby(batch_col)[status_col]
+                .apply(lambda s: "Week Closed" if s.astype(str).str.lower().str.contains("open", na=False).sum() == 0 else "Open")
+                .reset_index(name="Week State")
             )
-            st.plotly_chart(fig3, use_container_width=True)
+            weekly = weekly.merge(week_status, on=batch_col, how="left")
+
+        st.subheader("Orders by Week / Batch")
+        fig = px.bar(weekly, x=batch_col, y="Orders", hover_data=weekly.columns)
+        st.plotly_chart(fig, use_container_width=True)
+
+        if "Week State" in weekly.columns:
+            st.dataframe(weekly, use_container_width=True)
+
+    st.subheader("Open Orders")
+    if status_col:
+        open_df = work[work[status_col].astype(str).str.lower().str.contains("open", na=False)].copy()
+    else:
+        open_df = work.copy()
+
+    open_cols = [c for c in [order_col, date_col, material_col, status_col, batch_col, club_col, type_col, cdd_col] if c]
+    if open_cols:
+        st.dataframe(open_df[open_cols], use_container_width=True, height=350)
+
+    st.subheader("Duplicate Line Checker")
+    if order_col and material_col:
+        dup_df = work.copy()
+        dup_df["dup_key"] = dup_df[order_col].astype(str).str.strip() + "||" + dup_df[material_col].astype(str).str.strip()
+        dup_df["dup_count"] = dup_df.groupby("dup_key")["dup_key"].transform("count")
+        duplicates = dup_df[dup_df["dup_count"] > 1].copy()
+        if duplicates.empty:
+            st.success("No duplicate order + material combinations found.")
         else:
-            st.info("No club data available for current filter.")
-        st.markdown("</div>", unsafe_allow_html=True)
+            show_cols = [c for c in [order_col, material_col, batch_col, status_col, date_col, club_col] if c] + ["dup_count"]
+            st.warning(f"Found {len(duplicates):,} duplicate lines.")
+            st.dataframe(duplicates[show_cols], use_container_width=True, height=320)
+    else:
+        st.info("Duplicate checker needs both 'BC Order/SalesDocument' and 'MaterialNumber' columns.")
 
-    with bottom_right:
-        st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-        st.markdown("<div class='section-title'>Week Close Monitor</div>", unsafe_allow_html=True)
-        open_weeks_df = weekly_status_f[weekly_status_f["Week_Status"] == "Open"].copy()
-        closed_weeks_df = weekly_status_f[weekly_status_f["Week_Status"] == "Closed"].copy()
-        latest_date = orders_f["OrderDate"].max() if len(orders_f) else pd.NaT
 
-        st.write(f"Source rows: **{len(df_f):,}**")
-        st.write(f"Unique orders: **{len(orders_f):,}**")
-        st.write(f"Latest order date: **{latest_date.strftime('%d-%b-%Y') if pd.notna(latest_date) else '-'}**")
-        st.write(f"Duplicate rows found: **{int(df_f['Is Duplicate'].sum()):,}**")
+def page_fbb_shipment_details():
+    st.markdown('<div class="page-title">FBB-Shipment Details</div>', unsafe_allow_html=True)
+    df, upload_meta = load_dataset_df("fbb_shipment_details")
+    render_last_updated(upload_meta)
+    render_admin_upload_section("fbb_shipment_details")
+    render_export_section(df, "fbb_shipment_details", upload_meta)
+    st.divider()
 
-        st.markdown("**Open Weeks**")
-        if len(open_weeks_df) > 0:
-            for week in open_weeks_df["Year-Week"].tolist():
-                st.markdown(f"<span class='status-pill-open'>{week}</span>", unsafe_allow_html=True)
-        else:
-            st.markdown("<span class='status-pill-closed'>All weeks closed</span>", unsafe_allow_html=True)
+    if df.empty:
+        st.warning("No FBB-Shipment Details data uploaded yet.")
+        return
 
-        st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-        st.markdown("**Closed Weeks**")
-        if len(closed_weeks_df) > 0:
-            st.write(", ".join(closed_weeks_df["Year-Week"].astype(str).tolist()[:10]))
-        else:
-            st.write("-")
-        st.markdown("</div>", unsafe_allow_html=True)
+    work = df.copy()
 
-else:
-    st.markdown("<div class='section-card'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>Analyzer</div>", unsafe_allow_html=True)
+    sales_doc_col = first_existing_column(work, ["Sales Doc"])
+    order_col = first_existing_column(work, ["ORDER #"])
+    sku_col = first_existing_column(work, ["SKU/ ITEM #"])
+    qty_col = first_existing_column(work, ["Order qty"])
+    week_col = first_existing_column(work, ["WEEK"])
+    date_col = first_existing_column(work, ["DATE"])
+    code_col = first_existing_column(work, ["Code"])
+    ship_ref_col = first_existing_column(work, ["Shipment Ref#"])
+    ups_col = first_existing_column(work, ["UPS TRACKING # (NO SPACE)"])
 
-    a1, a2, a3, a4 = st.columns(4)
-    with a1:
-        status_filter = st.multiselect(
-            "Order Category",
-            sorted(df_f["Order Category"].dropna().unique()),
-            default=sorted(df_f["Order Category"].dropna().unique())
+    if date_col:
+        work[date_col] = parse_date_series(work[date_col])
+    if qty_col:
+        work[qty_col] = parse_numeric_series(work[qty_col])
+
+    total_rows = len(work)
+    total_orders = work[order_col].nunique() if order_col else total_rows
+    tracking_count = work[ups_col].notna().sum() if ups_col else 0
+    shipped_refs = work[ship_ref_col].notna().sum() if ship_ref_col else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Rows", f"{total_rows:,}")
+    c2.metric("Unique Orders", f"{total_orders:,}")
+    c3.metric("Shipment Ref Available", f"{int(shipped_refs):,}")
+    c4.metric("UPS Tracking Available", f"{int(tracking_count):,}")
+
+    if week_col and qty_col:
+        st.subheader("Shipment Qty by Week")
+        week_summary = (
+            work.groupby(week_col, dropna=False)[qty_col]
+            .sum(min_count=1)
+            .reset_index(name="Total Order Qty")
+            .sort_values(by=week_col)
         )
-    with a2:
-        dup_filter = st.selectbox("Duplicate Flag", ["All", "Duplicate", "Unique"], index=0)
-    with a3:
-        weeks_available = sorted([str(x) for x in df_f["Year-Week"].dropna().unique()])
-        week_filter = st.multiselect("Year-Week", weeks_available, default=weeks_available)
-    with a4:
-        search_order = st.text_input("Search Order No")
+        fig = px.bar(week_summary, x=week_col, y="Total Order Qty", hover_data=week_summary.columns)
+        st.plotly_chart(fig, use_container_width=True)
 
-    b1, b2, b3 = st.columns(3)
-    with b1:
-        material_search = st.text_input("Search Material")
-    with b2:
-        sales_doc_search = st.text_input("Search Sales Document")
-    with b3:
-        cleaned_export_name = st.text_input("Export file name", value="filtered_analyzer.xlsx")
+    st.subheader("Shipment Detail Table")
+    show_cols = [c for c in [sales_doc_col, order_col, sku_col, qty_col, week_col, date_col, code_col, ship_ref_col, ups_col] if c]
+    st.dataframe(work[show_cols], use_container_width=True, height=380)
 
-    view = df_f.copy()
+    if ups_col:
+        st.subheader("Rows Missing UPS Tracking")
+        missing = work[work[ups_col].isna() | (work[ups_col].astype(str).str.strip() == "")]
+        st.dataframe(missing[show_cols], use_container_width=True, height=280)
 
-    if status_filter:
-        view = view[view["Order Category"].isin(status_filter)]
-    if dup_filter != "All":
-        view = view[view["Duplicate Flag"] == dup_filter]
-    if week_filter:
-        view = view[view["Year-Week"].astype(str).isin(week_filter)]
-    if search_order.strip():
-        view = view[view["bc_order"].astype(str).str.contains(search_order.strip(), case=False, na=False)]
-    if material_search.strip():
-        view = view[view["material_number"].astype(str).str.contains(material_search.strip(), case=False, na=False)]
-    if sales_doc_search.strip():
-        view = view[view["sales_document"].astype(str).str.contains(sales_doc_search.strip(), case=False, na=False)]
 
-    preferred_cols = [
-        "bc_order", "sales_document", "club_name", "order_type", "material_number",
-        "batch_number", "order_status", "workflow_status", "Order Category",
-        "order_date", "cdd", "Month", "ISO Week", "Year-Week",
-        "Batch Count", "Duplicate Flag"
+def page_fbb_invoice_status():
+    st.markdown('<div class="page-title">FBB Invoice Status</div>', unsafe_allow_html=True)
+    df, upload_meta = load_dataset_df("fbb_invoice_status")
+    render_last_updated(upload_meta)
+    render_admin_upload_section("fbb_invoice_status")
+    render_export_section(df, "fbb_invoice_status", upload_meta)
+    st.divider()
+
+    if df.empty:
+        st.warning("No FBB Invoice Status data uploaded yet.")
+        return
+
+    work = df.copy()
+
+    num_orders_col = first_existing_column(work, ["Number of Orders"])
+    num_invoiced_col = first_existing_column(work, ["Number of Invoiced Orders"])
+    rem_orders_col = first_existing_column(work, ["Remaining Orders to Invoice"])
+    total_qty_col = first_existing_column(work, ["Total Qty Shipped"])
+    total_amount_col = first_existing_column(work, ["Total Amount"])
+    invoiced_qty_col = first_existing_column(work, ["Invoiced Qty"])
+    rem_qty_col = first_existing_column(work, ["Remaining Qty to invoice"])
+    rem_amt_col = first_existing_column(work, ["Remaining Amount to invoice"])
+    handover_col = first_existing_column(work, ["Hand Over"])
+    pickup_col = first_existing_column(work, ["UPS Pickup Date"])
+    days_col = first_existing_column(work, ["#Days"])
+    status_col = first_existing_column(work, ["Status"])
+    team_col = first_existing_column(work, ["Team"])
+
+    numeric_cols = [
+        num_orders_col,
+        num_invoiced_col,
+        rem_orders_col,
+        total_qty_col,
+        total_amount_col,
+        invoiced_qty_col,
+        rem_qty_col,
+        rem_amt_col,
+        days_col,
     ]
-    display_cols = [c for c in preferred_cols if c in view.columns]
-    view = view[display_cols].copy()
+    for c in [x for x in numeric_cols if x]:
+        work[c] = parse_numeric_series(work[c])
 
-    st.write(f"Filtered rows: **{len(view):,}**")
-    st.dataframe(view, use_container_width=True, height=560)
+    for c in [handover_col, pickup_col]:
+        if c:
+            work[c] = parse_date_series(work[c])
 
-    download_col1, download_col2 = st.columns([1, 1])
-    with download_col1:
-        export_name = cleaned_export_name.strip() or "filtered_analyzer.xlsx"
-        if not export_name.lower().endswith(".xlsx"):
-            export_name = f"{export_name}.xlsx"
-        st.download_button(
-            "Download filtered analyzer as Excel",
-            data=to_excel_bytes(view),
-            file_name=export_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    total_orders = int(work[num_orders_col].sum()) if num_orders_col else 0
+    total_invoiced = int(work[num_invoiced_col].sum()) if num_invoiced_col else 0
+    total_remaining = int(work[rem_orders_col].sum()) if rem_orders_col else 0
+    total_amount = float(work[total_amount_col].sum()) if total_amount_col else 0.0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Number of Orders", f"{total_orders:,}")
+    c2.metric("Invoiced Orders", f"{total_invoiced:,}")
+    c3.metric("Remaining Orders", f"{total_remaining:,}")
+    c4.metric("Total Amount", f"{total_amount:,.2f}")
+
+    if status_col:
+        st.subheader("By Status")
+        status_summary = (
+            work.groupby(status_col, dropna=False)[num_orders_col if num_orders_col else work.columns[0]]
+            .count()
+            .reset_index(name="Rows")
         )
-    with download_col2:
-        st.download_button(
-            "Download current view as CSV",
-            data=view.to_csv(index=False).encode("utf-8"),
-            file_name="filtered_analyzer.csv",
-            mime="text/csv"
-        )
+        fig = px.bar(status_summary, x=status_col, y="Rows", hover_data=status_summary.columns)
+        st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    if team_col and rem_amt_col:
+        st.subheader("Remaining Amount by Team")
+        team_summary = (
+            work.groupby(team_col, dropna=False)[rem_amt_col]
+            .sum(min_count=1)
+            .reset_index(name="Remaining Amount")
+        )
+        fig = px.bar(team_summary, x=team_col, y="Remaining Amount", hover_data=team_summary.columns)
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.subheader("Invoice Detail Table")
+    st.dataframe(work, use_container_width=True, height=420)
+
+
+def main():
+    init_state()
+    admin_sidebar()
+
+    page = st.session_state.page
+
+    if page == "home":
+        home_page()
+    elif page == "order_dashboard":
+        page_order_dashboard()
+    elif page == "fbb_shipment_details":
+        page_fbb_shipment_details()
+    elif page == "fbb_invoice_status":
+        page_fbb_invoice_status()
+    else:
+        home_page()
+
+
+if __name__ == "__main__":
+    main()

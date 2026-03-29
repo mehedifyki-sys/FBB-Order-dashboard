@@ -1,4 +1,6 @@
 import io
+import re
+import math
 import hashlib
 import hmac
 from typing import Any
@@ -174,14 +176,18 @@ def parse_numeric_series(series: pd.Series) -> pd.Series:
 def normalize_value_for_json(value: Any):
     if pd.isna(value):
         return None
+
     if isinstance(value, pd.Timestamp):
-        return value.isoformat()
+        return value.strftime("%Y-%m-%d")
+
     return value
 
 
 def safe_text(value: Any):
     if pd.isna(value):
         return None
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
     return str(value)
 
 
@@ -189,12 +195,22 @@ def safe_num(value: Any):
     if pd.isna(value):
         return None
     try:
-        return float(value)
+        num = float(value)
+        if math.isfinite(num):
+            return num
+        return None
     except Exception:
         return None
 
 
-def batched(seq, size=200):
+def trim_text(value: Any, max_len: int):
+    text = safe_text(value)
+    if text is None:
+        return None
+    return text[:max_len]
+
+
+def batched(seq, size=50):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
@@ -217,9 +233,10 @@ def clear_caches():
     load_raw_export_df.clear()
 
 
-def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = 200):
+def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = 50):
     if not rows:
         return
+
     sb = get_supabase()
     for chunk in batched(rows, chunk_size):
         sb.table(table_name).insert(chunk).execute()
@@ -247,6 +264,58 @@ def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
     if old_ids:
         sb.table("app_uploads").update({"is_active": False}).in_("id", old_ids).execute()
     return old_ids
+
+
+def week_sort_parts(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return (999999, 999999, "")
+
+    text = str(value).strip()
+
+    main_match = re.search(r'(\d+)', text)
+    main_num = int(main_match.group(1)) if main_match else 999999
+
+    suffix_match = re.search(r'#(\d+)', text)
+    suffix_num = int(suffix_match.group(1)) if suffix_match else 0
+
+    return (main_num, suffix_num, text.lower())
+
+
+def sort_week_dataframe(df: pd.DataFrame, week_col: str) -> pd.DataFrame:
+    if df.empty or week_col not in df.columns:
+        return df
+
+    tmp = df.copy()
+    tmp["_week_sort"] = tmp[week_col].apply(week_sort_parts)
+    tmp = tmp.sort_values("_week_sort").drop(columns=["_week_sort"])
+    tmp = tmp.reset_index(drop=True)
+    return tmp
+
+
+def search_dataframe(df: pd.DataFrame, query: str) -> pd.DataFrame:
+    if not query or df.empty:
+        return df
+    mask = df.astype(str).apply(lambda col: col.str.contains(query, case=False, na=False))
+    return df[mask.any(axis=1)]
+
+
+def clean_export_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = out[col].dt.strftime("%Y-%m-%d")
+
+        elif out[col].dtype == object:
+            def fix_obj(v):
+                if pd.isna(v):
+                    return None
+                if isinstance(v, pd.Timestamp):
+                    return v.strftime("%Y-%m-%d")
+                return v
+            out[col] = out[col].apply(fix_obj)
+
+    return out
 
 
 # =========================================================
@@ -332,12 +401,13 @@ def load_raw_export_df(upload_id: int, column_order: tuple):
     else:
         df = pd.DataFrame(columns=list(column_order))
 
+    df = clean_export_dataframe(df)
     return df
 
 
 def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    with pd.ExcelWriter(output, engine="openpyxl", datetime_format="YYYY-MM-DD") as writer:
         df.to_excel(writer, index=False, sheet_name=(sheet_name[:31] if sheet_name else "Data"))
     output.seek(0)
     return output.getvalue()
@@ -395,6 +465,8 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
         else:
             weekly["week_state"] = None
 
+        weekly = sort_week_dataframe(weekly, batch_col)
+
         for _, row in weekly.iterrows():
             weekly_rows.append({
                 "upload_id": upload_id,
@@ -412,15 +484,15 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
     for _, row in open_df.iterrows():
         open_rows.append({
             "upload_id": upload_id,
-            "bc_order": safe_text(row[order_col]) if order_col else None,
-            "sales_document": safe_text(row[sales_doc_col]) if sales_doc_col else None,
-            "material_number": safe_text(row[material_col]) if material_col else None,
-            "status_value": safe_text(row[status_col]) if status_col else None,
-            "batch_number": safe_text(row[batch_col]) if batch_col else None,
+            "bc_order": trim_text(row[order_col], 100) if order_col else None,
+            "sales_document": trim_text(row[sales_doc_col], 100) if sales_doc_col else None,
+            "material_number": trim_text(row[material_col], 150) if material_col else None,
+            "status_value": trim_text(row[status_col], 100) if status_col else None,
+            "batch_number": trim_text(row[batch_col], 60) if batch_col else None,
             "order_date": safe_text(row[date_col]) if date_col else None,
             "cdd": safe_text(row[cdd_col]) if cdd_col else None,
-            "club_name": safe_text(row[club_col]) if club_col else None,
-            "order_type": safe_text(row[type_col]) if type_col else None,
+            "club_name": trim_text(row[club_col], 150) if club_col else None,
+            "order_type": trim_text(row[type_col], 100) if type_col else None,
         })
 
     duplicate_rows = []
@@ -433,13 +505,13 @@ def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
         for _, row in duplicates.iterrows():
             duplicate_rows.append({
                 "upload_id": upload_id,
-                "bc_order": safe_text(row[order_col]) if order_col else None,
-                "sales_document": safe_text(row[sales_doc_col]) if sales_doc_col else None,
-                "material_number": safe_text(row[material_col]) if material_col else None,
-                "batch_number": safe_text(row[batch_col]) if batch_col else None,
-                "status_value": safe_text(row[status_col]) if status_col else None,
+                "bc_order": trim_text(row[order_col], 100) if order_col else None,
+                "sales_document": trim_text(row[sales_doc_col], 100) if sales_doc_col else None,
+                "material_number": trim_text(row[material_col], 150) if material_col else None,
+                "batch_number": trim_text(row[batch_col], 60) if batch_col else None,
+                "status_value": trim_text(row[status_col], 100) if status_col else None,
                 "order_date": safe_text(row[date_col]) if date_col else None,
-                "club_name": safe_text(row[club_col]) if club_col else None,
+                "club_name": trim_text(row[club_col], 150) if club_col else None,
                 "dup_count": int(row["dup_count"]) if pd.notna(row["dup_count"]) else None,
             })
 
@@ -481,6 +553,8 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
             .sum(min_count=1)
             .reset_index(name="total_order_qty")
         )
+        weekly = sort_week_dataframe(weekly, week_col)
+
         for _, row in weekly.iterrows():
             weekly_rows.append({
                 "upload_id": upload_id,
@@ -492,15 +566,15 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
     for _, row in work.iterrows():
         compact_rows.append({
             "upload_id": upload_id,
-            "sales_doc": safe_text(row[sales_doc_col]) if sales_doc_col else None,
-            "order_number": safe_text(row[order_col]) if order_col else None,
-            "sku_item": safe_text(row[sku_col]) if sku_col else None,
+            "sales_doc": trim_text(row[sales_doc_col], 100) if sales_doc_col else None,
+            "order_number": trim_text(row[order_col], 100) if order_col else None,
+            "sku_item": trim_text(row[sku_col], 150) if sku_col else None,
             "order_qty": safe_num(row[qty_col]) if qty_col else None,
-            "week_value": safe_text(row[week_col]) if week_col else None,
+            "week_value": trim_text(row[week_col], 60) if week_col else None,
             "date_value": safe_text(row[date_col]) if date_col else None,
-            "code": safe_text(row[code_col]) if code_col else None,
-            "shipment_ref": safe_text(row[ship_ref_col]) if ship_ref_col else None,
-            "ups_tracking": safe_text(row[ups_col]) if ups_col else None,
+            "code": trim_text(row[code_col], 100) if code_col else None,
+            "shipment_ref": trim_text(row[ship_ref_col], 150) if ship_ref_col else None,
+            "ups_tracking": trim_text(row[ups_col], 150) if ups_col else None,
         })
 
     return metrics_rows, weekly_rows, compact_rows
@@ -555,7 +629,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
         for _, row in summary.iterrows():
             status_rows.append({
                 "upload_id": upload_id,
-                "status_value": safe_text(row[status_col]),
+                "status_value": trim_text(row[status_col], 100),
                 "row_count": int(row["row_count"]) if pd.notna(row["row_count"]) else None,
             })
 
@@ -569,7 +643,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
         for _, row in summary.iterrows():
             team_rows.append({
                 "upload_id": upload_id,
-                "team_value": safe_text(row[team_col]),
+                "team_value": trim_text(row[team_col], 100),
                 "remaining_amount": safe_num(row["remaining_amount"]),
             })
 
@@ -577,9 +651,9 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     for _, row in work.iterrows():
         compact_rows.append({
             "upload_id": upload_id,
-            "sp_no": safe_text(row[sp_col]) if sp_col else None,
-            "bd_ref": safe_text(row[bd_col]) if bd_col else None,
-            "cs_ref": safe_text(row[cs_col]) if cs_col else None,
+            "sp_no": trim_text(row[sp_col], 100) if sp_col else None,
+            "bd_ref": trim_text(row[bd_col], 100) if bd_col else None,
+            "cs_ref": trim_text(row[cs_col], 100) if cs_col else None,
             "number_of_orders": safe_num(row[num_orders_col]) if num_orders_col else None,
             "number_of_invoiced_orders": safe_num(row[num_invoiced_col]) if num_invoiced_col else None,
             "remaining_orders_to_invoice": safe_num(row[rem_orders_col]) if rem_orders_col else None,
@@ -591,8 +665,8 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
             "hand_over": safe_text(row[handover_col]) if handover_col else None,
             "ups_pickup_date": safe_text(row[pickup_col]) if pickup_col else None,
             "days_value": safe_num(row[days_col]) if days_col else None,
-            "status_value": safe_text(row[status_col]) if status_col else None,
-            "team_value": safe_text(row[team_col]) if team_col else None,
+            "status_value": trim_text(row[status_col], 100) if status_col else None,
+            "team_value": trim_text(row[team_col], 100) if team_col else None,
         })
 
     return metrics_rows, status_rows, team_rows, compact_rows
@@ -639,27 +713,27 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
             }
             for item in dataframe_to_raw_records(df)
         ]
-        insert_in_chunks("dataset_raw_rows", raw_rows, 200)
+        insert_in_chunks("dataset_raw_rows", raw_rows, 50)
 
         if dataset_key == "order_dashboard":
             metrics_rows, weekly_rows, open_rows, duplicate_rows = build_order_dashboard_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, 200)
-            insert_in_chunks("order_weekly_summary", weekly_rows, 200)
-            insert_in_chunks("order_open_orders", open_rows, 200)
-            insert_in_chunks("order_duplicate_lines", duplicate_rows, 200)
+            insert_in_chunks("dataset_metrics", metrics_rows, 50)
+            insert_in_chunks("order_weekly_summary", weekly_rows, 50)
+            insert_in_chunks("order_open_orders", open_rows, 50)
+            insert_in_chunks("order_duplicate_lines", duplicate_rows, 50)
 
         elif dataset_key == "fbb_shipment_details":
             metrics_rows, weekly_rows, compact_rows = build_shipment_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, 200)
-            insert_in_chunks("shipment_weekly_summary", weekly_rows, 200)
-            insert_in_chunks("shipment_detail_compact", compact_rows, 200)
+            insert_in_chunks("dataset_metrics", metrics_rows, 50)
+            insert_in_chunks("shipment_weekly_summary", weekly_rows, 50)
+            insert_in_chunks("shipment_detail_compact", compact_rows, 50)
 
         elif dataset_key == "fbb_invoice_status":
             metrics_rows, status_rows, team_rows, compact_rows = build_invoice_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, 200)
-            insert_in_chunks("invoice_status_summary", status_rows, 200)
-            insert_in_chunks("invoice_team_summary", team_rows, 200)
-            insert_in_chunks("invoice_detail_compact", compact_rows, 200)
+            insert_in_chunks("dataset_metrics", metrics_rows, 50)
+            insert_in_chunks("invoice_status_summary", status_rows, 50)
+            insert_in_chunks("invoice_team_summary", team_rows, 50)
+            insert_in_chunks("invoice_detail_compact", compact_rows, 50)
 
         old_upload_ids = deactivate_old_uploads(dataset_key, upload_id)
         delete_old_upload_related_data(old_upload_ids, dataset_key)
@@ -918,6 +992,7 @@ def page_order_dashboard():
     weekly_rows = load_table_records("order_weekly_summary", upload_id)
     if weekly_rows:
         weekly_df = pd.DataFrame(weekly_rows)[["batch_number", "orders_count", "week_state"]]
+        weekly_df = sort_week_dataframe(weekly_df, "batch_number")
         st.subheader("Orders by Week / Batch")
         fig = px.bar(weekly_df, x="batch_number", y="orders_count", hover_data=weekly_df.columns)
         st.plotly_chart(fig, use_container_width=True)
@@ -930,6 +1005,8 @@ def page_order_dashboard():
             "bc_order", "sales_document", "material_number", "status_value",
             "batch_number", "order_date", "cdd", "club_name", "order_type"
         ]]
+        search_text = st.text_input("Search Open Orders", key="search_open_orders")
+        open_df = search_dataframe(open_df, search_text)
         st.caption("Showing up to 2,000 open-order rows for faster viewing.")
         st.dataframe(open_df, use_container_width=True, height=360)
     else:
@@ -942,6 +1019,8 @@ def page_order_dashboard():
             "bc_order", "sales_document", "material_number", "batch_number",
             "status_value", "order_date", "club_name", "dup_count"
         ]]
+        dup_search = st.text_input("Search Duplicate Lines", key="search_duplicate_lines")
+        dup_df = search_dataframe(dup_df, dup_search)
         st.caption("Showing up to 2,000 duplicate rows for faster viewing.")
         st.dataframe(dup_df, use_container_width=True, height=340)
     else:
@@ -978,6 +1057,7 @@ def page_fbb_shipment_details():
     weekly_rows = load_table_records("shipment_weekly_summary", upload_id)
     if weekly_rows:
         weekly_df = pd.DataFrame(weekly_rows)[["week_value", "total_order_qty"]]
+        weekly_df = sort_week_dataframe(weekly_df, "week_value")
         st.subheader("Shipment Qty by Week")
         fig = px.bar(weekly_df, x="week_value", y="total_order_qty", hover_data=weekly_df.columns)
         st.plotly_chart(fig, use_container_width=True)
@@ -989,6 +1069,9 @@ def page_fbb_shipment_details():
             "sales_doc", "order_number", "sku_item", "order_qty",
             "week_value", "date_value", "code", "shipment_ref", "ups_tracking"
         ]]
+        shipment_search = st.text_input("Search Shipment Details", key="search_shipment_details")
+        detail_df = search_dataframe(detail_df, shipment_search)
+
         st.caption("Showing up to 2,000 rows for faster viewing.")
         st.dataframe(detail_df, use_container_width=True, height=400)
 
@@ -1051,6 +1134,9 @@ def page_fbb_invoice_status():
             "invoiced_qty", "remaining_qty_to_invoice", "remaining_amount_to_invoice",
             "hand_over", "ups_pickup_date", "days_value", "status_value", "team_value"
         ]]
+        invoice_search = st.text_input("Search Invoice Details", key="search_invoice_details")
+        detail_df = search_dataframe(detail_df, invoice_search)
+
         st.caption("Showing up to 2,000 rows for faster viewing.")
         st.dataframe(detail_df, use_container_width=True, height=420)
     else:

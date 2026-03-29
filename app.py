@@ -1,6 +1,10 @@
 import io
+import os
+import re
 import hashlib
 import hmac
+from datetime import datetime, timezone
+from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
@@ -29,12 +33,10 @@ st.markdown("""
     padding-left: 2rem !important;
     padding-right: 2rem !important;
 }
-
 h1, h2, h3 {
     padding-top: 0.15rem !important;
     margin-top: 0 !important;
 }
-
 .page-title {
     font-size: 2.15rem;
     font-weight: 800;
@@ -42,13 +44,11 @@ h1, h2, h3 {
     line-height: 1.25;
     padding-top: 0.1rem;
 }
-
 .page-subtitle {
     color: #9aa0a6;
     font-size: 1rem;
     margin-bottom: 1rem;
 }
-
 .card {
     border: 1px solid rgba(140, 140, 140, 0.22);
     border-radius: 18px;
@@ -59,7 +59,6 @@ h1, h2, h3 {
     flex-direction: column;
     justify-content: center;
 }
-
 .metric-card {
     border: 1px solid rgba(140, 140, 140, 0.22);
     border-radius: 16px;
@@ -67,35 +66,29 @@ h1, h2, h3 {
     background: rgba(255,255,255,0.03);
     min-height: 92px;
 }
-
 .small-muted {
     color: #9aa0a6;
     font-size: 0.92rem;
     margin-bottom: 6px;
 }
-
 .big-number {
     font-size: 1.75rem;
     font-weight: 750;
     line-height: 1.2;
 }
-
 hr {
     margin-top: 1.5rem !important;
     margin-bottom: 1.5rem !important;
 }
-
 div[data-testid="stMetric"] {
     background: rgba(255,255,255,0.02);
     border: 1px solid rgba(140, 140, 140, 0.15);
     padding: 14px 16px;
     border-radius: 16px;
 }
-
 div[data-testid="stFileUploader"] {
     border-radius: 14px;
 }
-
 div[data-testid="stDownloadButton"] > button,
 div[data-testid="stButton"] > button,
 div[data-testid="baseButton-secondary"] {
@@ -105,28 +98,23 @@ div[data-testid="baseButton-secondary"] {
 </style>
 """, unsafe_allow_html=True)
 
-
 # =========================================================
 # DATASET CONFIG
 # =========================================================
 DATASETS = {
     "order_dashboard": {
         "label": "Order Dashboard",
-        "rows_table": "order_dashboard_rows",
         "download_name": "Order_Dashboard.xlsx",
     },
     "fbb_shipment_details": {
         "label": "FBB-Shipment Details",
-        "rows_table": "fbb_shipment_details_rows",
         "download_name": "FBB_Shipment_Details.xlsx",
     },
     "fbb_invoice_status": {
         "label": "FBB Invoice Status",
-        "rows_table": "fbb_invoice_status_rows",
         "download_name": "FBB_Invoice_Status.xlsx",
     },
 }
-
 
 # =========================================================
 # HELPERS
@@ -157,6 +145,10 @@ def current_admin_name():
     return st.secrets.get("ADMIN_DISPLAY_NAME", st.secrets.get("ADMIN_USERNAME", "Admin"))
 
 
+def storage_bucket() -> str:
+    return st.secrets.get("SUPABASE_STORAGE_BUCKET", "dashboard-files")
+
+
 def first_existing_column(df: pd.DataFrame, candidates):
     for col in candidates:
         if col in df.columns:
@@ -172,53 +164,48 @@ def parse_numeric_series(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def normalize_value_for_json(value):
-    if pd.isna(value):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
-    return value
+def sanitize_filename(name: str) -> str:
+    name = Path(name).name
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
 
-def batched(seq, size=200):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
+def timestamp_string() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
-def dataframe_to_records(df: pd.DataFrame):
-    records = []
-    for i, row in df.iterrows():
-        row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
-        records.append({
-            "row_number": int(i) + 1,
-            "row_data": row_dict
-        })
-    return records
+def file_ext_lower(filename: str) -> str:
+    return Path(filename).suffix.lower()
 
 
-def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=(sheet_name[:31] if sheet_name else "Data"))
-    output.seek(0)
-    return output.getvalue()
+def excel_bytes_to_df(file_bytes: bytes):
+    bio = io.BytesIO(file_bytes)
+    xls = pd.ExcelFile(bio)
+    sheet_name = xls.sheet_names[0]
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name)
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(how="all").reset_index(drop=True)
+    return df, sheet_name
 
 
 def clear_caches():
     load_active_upload_meta.clear()
+    load_file_bytes_from_storage.clear()
     load_dataset_df.clear()
 
 
 # =========================================================
-# DATABASE READ
+# DATABASE + STORAGE READ
 # =========================================================
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=600)
 def load_active_upload_meta(dataset_key: str):
     sb = get_supabase()
     try:
         resp = (
             sb.table("app_uploads")
-            .select("id,dataset_key,original_filename,uploaded_by,uploaded_at,row_count,column_order,sheet_name,is_active")
+            .select(
+                "id,dataset_key,original_filename,uploaded_by,uploaded_at,row_count,"
+                "column_order,sheet_name,is_active,storage_bucket,storage_path,file_size_bytes"
+            )
             .eq("dataset_key", dataset_key)
             .eq("is_active", True)
             .order("id", desc=True)
@@ -233,60 +220,30 @@ def load_active_upload_meta(dataset_key: str):
         return None
 
 
-@st.cache_data(ttl=30)
-def load_dataset_df(dataset_key: str):
-    cfg = DATASETS[dataset_key]
-    upload_meta = load_active_upload_meta(dataset_key)
-
-    if not upload_meta:
-        return pd.DataFrame(), None
-
+@st.cache_data(ttl=600)
+def load_file_bytes_from_storage(bucket: str, path: str):
     sb = get_supabase()
-    upload_id = upload_meta["id"]
+    try:
+        return sb.storage.from_(bucket).download(path)
+    except Exception as e:
+        raise RuntimeError(f"Storage download error: {e}") from e
+
+
+@st.cache_data(ttl=600)
+def load_dataset_df(dataset_key: str):
+    upload_meta = load_active_upload_meta(dataset_key)
+    if not upload_meta:
+        return pd.DataFrame(), None, b""
+
+    bucket = upload_meta["storage_bucket"]
+    path = upload_meta["storage_path"]
 
     try:
-        count_resp = (
-            sb.table(cfg["rows_table"])
-            .select("id", count="exact")
-            .eq("upload_id", upload_id)
-            .execute()
-        )
-        total_count = count_resp.count or 0
+        file_bytes = load_file_bytes_from_storage(bucket, path)
+        df, _sheet_name = excel_bytes_to_df(file_bytes)
     except Exception as e:
-        st.error(f"Row count load error: {e}")
-        return pd.DataFrame(), upload_meta
-
-    all_rows = []
-    page_size = 1000
-    last_row_number = 0
-
-    while True:
-        try:
-            resp = (
-                sb.table(cfg["rows_table"])
-                .select("row_number,row_data")
-                .eq("upload_id", upload_id)
-                .gt("row_number", last_row_number)
-                .order("row_number")
-                .limit(page_size)
-                .execute()
-            )
-        except Exception as e:
-            st.error(f"Row page load error after row {last_row_number}: {e}")
-            break
-
-        batch = resp.data or []
-        if not batch:
-            break
-
-        all_rows.extend(batch)
-        last_row_number = batch[-1]["row_number"]
-
-        if len(all_rows) >= total_count:
-            break
-
-    records = [r["row_data"] for r in all_rows]
-    df = pd.DataFrame(records)
+        st.error(str(e))
+        return pd.DataFrame(), upload_meta, b""
 
     column_order = upload_meta.get("column_order", []) or []
     ordered_cols = [c for c in column_order if c in df.columns]
@@ -297,11 +254,11 @@ def load_dataset_df(dataset_key: str):
     else:
         df = pd.DataFrame(columns=column_order)
 
-    return df, upload_meta
+    return df, upload_meta, file_bytes
 
 
 # =========================================================
-# DATABASE WRITE
+# DATABASE + STORAGE WRITE
 # =========================================================
 def set_old_uploads_inactive(sb: Client, dataset_key: str, new_upload_id: int):
     existing = (
@@ -313,80 +270,98 @@ def set_old_uploads_inactive(sb: Client, dataset_key: str, new_upload_id: int):
         .execute()
     )
     old_ids = [r["id"] for r in (existing.data or [])]
-
     if old_ids:
         sb.table("app_uploads").update({"is_active": False}).in_("id", old_ids).execute()
-
     return old_ids
 
 
-def delete_old_rows(sb: Client, rows_table: str, old_upload_ids: list[int]):
-    if old_upload_ids:
-        sb.table(rows_table).delete().in_("upload_id", old_upload_ids).execute()
+def delete_storage_file_if_exists(bucket: str, path: str):
+    sb = get_supabase()
+    try:
+        sb.storage.from_(bucket).remove([path])
+    except Exception:
+        pass
 
 
 def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     cfg = DATASETS[dataset_key]
     sb = get_supabase()
 
+    original_filename = sanitize_filename(uploaded_file.name)
+    file_bytes = uploaded_file.getvalue()
+
     try:
-        excel = pd.ExcelFile(uploaded_file)
-        sheet_name = excel.sheet_names[0]
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        df, sheet_name = excel_bytes_to_df(file_bytes)
     except Exception as e:
         return False, f"Could not read Excel file: {e}"
-
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(how="all").reset_index(drop=True)
 
     if df.empty:
         return False, "Uploaded file is empty after removing blank rows."
 
+    bucket = storage_bucket()
+    storage_path = f"{dataset_key}/{timestamp_string()}__{original_filename}"
+    ext = file_ext_lower(original_filename)
+    content_type = (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        if ext == ".xlsx"
+        else "application/vnd.ms-excel"
+    )
+
+    try:
+        sb.storage.from_(bucket).upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={
+                "content-type": content_type,
+                "upsert": "false",
+            },
+        )
+    except Exception as e:
+        return False, f"Storage upload failed: {e}"
+
     upload_payload = {
         "dataset_key": dataset_key,
-        "original_filename": uploaded_file.name,
+        "original_filename": original_filename,
         "uploaded_by": admin_name,
         "row_count": int(len(df)),
         "column_order": list(df.columns),
         "sheet_name": sheet_name,
         "is_active": True,
+        "storage_bucket": bucket,
+        "storage_path": storage_path,
+        "file_size_bytes": len(file_bytes),
     }
 
     try:
         upload_resp = sb.table("app_uploads").insert(upload_payload).execute()
         upload_id = upload_resp.data[0]["id"]
 
-        records = dataframe_to_records(df)
-        for chunk in batched(records, 200):
-            payload = [
-                {
-                    "upload_id": upload_id,
-                    "row_number": item["row_number"],
-                    "row_data": item["row_data"],
-                }
-                for item in chunk
-            ]
-            sb.table(cfg["rows_table"]).insert(payload).execute()
-
-        verify_resp = (
-            sb.table(cfg["rows_table"])
-            .select("id", count="exact")
-            .eq("upload_id", upload_id)
+        old_active = (
+            sb.table("app_uploads")
+            .select("id,storage_bucket,storage_path")
+            .eq("dataset_key", dataset_key)
+            .eq("is_active", True)
+            .neq("id", upload_id)
             .execute()
         )
-        inserted_count = verify_resp.count or 0
+        old_rows = old_active.data or []
 
-        if inserted_count != len(df):
-            return False, f"Upload mismatch: expected {len(df)} rows but found {inserted_count} rows in database."
+        set_old_uploads_inactive(sb, dataset_key, upload_id)
 
-        old_upload_ids = set_old_uploads_inactive(sb, dataset_key, upload_id)
-        delete_old_rows(sb, cfg["rows_table"], old_upload_ids)
+        # Optional cleanup of old files after new upload succeeds
+        for row in old_rows:
+            old_bucket = row.get("storage_bucket")
+            old_path = row.get("storage_path")
+            if old_bucket and old_path:
+                delete_storage_file_if_exists(old_bucket, old_path)
 
         clear_caches()
-        return True, f"{cfg['label']} uploaded successfully. Loaded rows: {inserted_count:,}"
+        return True, f"{cfg['label']} uploaded successfully. Rows: {len(df):,}"
 
     except Exception as e:
-        return False, f"Upload failed: {e}"
+        # rollback storage file if metadata insert fails
+        delete_storage_file_if_exists(bucket, storage_path)
+        return False, f"Metadata save failed: {e}"
 
 
 # =========================================================
@@ -438,22 +413,20 @@ def render_last_updated(upload_meta: dict | None):
         )
 
 
-def render_export_section(df: pd.DataFrame, dataset_key: str, upload_meta: dict | None):
+def render_export_section(dataset_key: str, df: pd.DataFrame, upload_meta: dict | None, file_bytes: bytes):
     cfg = DATASETS[dataset_key]
     st.subheader("Export")
 
-    if df.empty:
+    if df.empty or not upload_meta or not file_bytes:
         st.warning("No data available for export.")
         return
 
-    sheet_name = upload_meta.get("sheet_name", cfg["label"]) if upload_meta else cfg["label"]
-    file_name = upload_meta.get("original_filename", cfg["download_name"]) if upload_meta else cfg["download_name"]
-    data = excel_bytes_from_df(df, sheet_name)
+    original_filename = upload_meta.get("original_filename", cfg["download_name"])
 
     st.download_button(
-        label="⬇️ Download current dataset",
-        data=data,
-        file_name=file_name,
+        label="⬇️ Download original uploaded file",
+        data=file_bytes,
+        file_name=original_filename,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -596,19 +569,19 @@ def home_page():
 def page_order_dashboard():
     render_page_header("Order Dashboard", "Order-level summary, week analysis, open lines and duplicate check.")
 
-    df, upload_meta = load_dataset_df("order_dashboard")
+    df, upload_meta, file_bytes = load_dataset_df("order_dashboard")
 
     if upload_meta:
         expected_rows = int(upload_meta.get("row_count", 0))
         st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {expected_rows:,}")
         if len(df) != expected_rows:
-            st.error("Dataset load mismatch detected. Some rows are not being read from Supabase correctly.")
+            st.error("Loaded row count does not match metadata. Please re-upload the dataset.")
 
     render_last_updated(upload_meta)
     st.markdown("<br>", unsafe_allow_html=True)
     render_admin_upload_section("order_dashboard")
     st.markdown("<br>", unsafe_allow_html=True)
-    render_export_section(df, "order_dashboard", upload_meta)
+    render_export_section("order_dashboard", df, upload_meta, file_bytes)
     st.divider()
 
     if df.empty:
@@ -704,19 +677,19 @@ def page_order_dashboard():
 def page_fbb_shipment_details():
     render_page_header("FBB-Shipment Details", "Shipment summary, weekly shipped quantity and tracking visibility.")
 
-    df, upload_meta = load_dataset_df("fbb_shipment_details")
+    df, upload_meta, file_bytes = load_dataset_df("fbb_shipment_details")
 
     if upload_meta:
         expected_rows = int(upload_meta.get("row_count", 0))
         st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {expected_rows:,}")
         if len(df) != expected_rows:
-            st.error("Dataset load mismatch detected. Some rows are not being read from Supabase correctly.")
+            st.error("Loaded row count does not match metadata. Please re-upload the dataset.")
 
     render_last_updated(upload_meta)
     st.markdown("<br>", unsafe_allow_html=True)
     render_admin_upload_section("fbb_shipment_details")
     st.markdown("<br>", unsafe_allow_html=True)
-    render_export_section(df, "fbb_shipment_details", upload_meta)
+    render_export_section("fbb_shipment_details", df, upload_meta, file_bytes)
     st.divider()
 
     if df.empty:
@@ -778,19 +751,19 @@ def page_fbb_shipment_details():
 def page_fbb_invoice_status():
     render_page_header("FBB Invoice Status", "Invoice progress, remaining quantity and team/status analysis.")
 
-    df, upload_meta = load_dataset_df("fbb_invoice_status")
+    df, upload_meta, file_bytes = load_dataset_df("fbb_invoice_status")
 
     if upload_meta:
         expected_rows = int(upload_meta.get("row_count", 0))
         st.caption(f"Loaded rows in dashboard: {len(df):,} / Expected rows: {expected_rows:,}")
         if len(df) != expected_rows:
-            st.error("Dataset load mismatch detected. Some rows are not being read from Supabase correctly.")
+            st.error("Loaded row count does not match metadata. Please re-upload the dataset.")
 
     render_last_updated(upload_meta)
     st.markdown("<br>", unsafe_allow_html=True)
     render_admin_upload_section("fbb_invoice_status")
     st.markdown("<br>", unsafe_allow_html=True)
-    render_export_section(df, "fbb_invoice_status", upload_meta)
+    render_export_section("fbb_invoice_status", df, upload_meta, file_bytes)
     st.divider()
 
     if df.empty:

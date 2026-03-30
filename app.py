@@ -62,11 +62,12 @@ h1, h2, h3 {
     border: 1px solid rgba(140, 140, 140, 0.22);
     border-radius: 16px;
     padding: 14px 16px;
-    background: rgba(255,255,255,0.03);
+    background: rgba(255,255,255,0.05);
     min-height: 92px;
+    color: #f8fafc;
 }
 .small-muted {
-    color: #9aa0a6;
+    color: #b8c0cc;
     font-size: 0.92rem;
     margin-bottom: 6px;
 }
@@ -74,6 +75,7 @@ h1, h2, h3 {
     font-size: 1.75rem;
     font-weight: 750;
     line-height: 1.2;
+    color: #f8fafc;
 }
 .big-number-small {
     font-size: 1.05rem;
@@ -81,6 +83,7 @@ h1, h2, h3 {
     line-height: 1.2;
     white-space: normal;
     word-break: break-word;
+    color: #f8fafc;
 }
 div[data-testid="stMetric"] {
     background: rgba(255,255,255,0.02);
@@ -826,19 +829,37 @@ def render_page_header(title: str, subtitle: str = ""):
 def render_local_time_card(uploaded_at: str):
     if not uploaded_at:
         html = """
-        <div class="metric-card" style="min-height:92px;">
-          <div class="small-muted">Updated at</div>
-          <div class="big-number-small">-</div>
+        <div style="
+            border: 1px solid rgba(140, 140, 140, 0.22);
+            border-radius: 16px;
+            padding: 14px 16px;
+            background: rgba(255,255,255,0.05);
+            min-height: 92px;
+            color: #f8fafc;
+            font-family: Arial, sans-serif;
+            box-sizing: border-box;
+        ">
+          <div style="color:#b8c0cc; font-size:0.92rem; margin-bottom:6px;">Updated at</div>
+          <div style="font-size:1.05rem; font-weight:750; line-height:1.2; color:#f8fafc;">-</div>
         </div>
         """
-        st.markdown(html, unsafe_allow_html=True)
+        components.html(html, height=96)
         return
 
     iso_str = str(uploaded_at)
     html = f"""
-    <div class="metric-card" style="min-height:92px;">
-      <div class="small-muted">Updated at</div>
-      <div id="local-updated-time" class="big-number-small">Loading...</div>
+    <div style="
+        border: 1px solid rgba(140, 140, 140, 0.22);
+        border-radius: 16px;
+        padding: 14px 16px;
+        background: rgba(255,255,255,0.05);
+        min-height: 92px;
+        color: #f8fafc;
+        font-family: Arial, sans-serif;
+        box-sizing: border-box;
+    ">
+      <div style="color:#b8c0cc; font-size:0.92rem; margin-bottom:6px;">Updated at</div>
+      <div id="local-updated-time" style="font-size:1.05rem; font-weight:750; line-height:1.2; color:#f8fafc;">Loading...</div>
     </div>
     <script>
       const iso = {iso_str!r};
@@ -858,7 +879,6 @@ def render_local_time_card(uploaded_at: str):
     </script>
     """
     components.html(html, height=96)
-
 
 def render_last_updated(upload_meta: dict | None):
     st.subheader("Last Updated")

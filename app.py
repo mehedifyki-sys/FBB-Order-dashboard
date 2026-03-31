@@ -249,6 +249,13 @@ def batched(seq, size=DB_INSERT_CHUNK):
         yield seq[i:i + size]
 
 
+def clear_caches():
+    load_active_upload_meta.clear()
+    load_metrics_map.clear()
+    load_table_records.clear()
+    load_export_df.clear()
+
+
 def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
     sb = get_supabase()
     last_error = None

@@ -1,6 +1,7 @@
 import io
 import re
 import math
+import time
 import hashlib
 import hmac
 from typing import Any
@@ -10,6 +11,7 @@ import plotly.express as px
 import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
 
 # =========================================================
@@ -62,12 +64,11 @@ h1, h2, h3 {
     border: 1px solid rgba(140, 140, 140, 0.22);
     border-radius: 16px;
     padding: 14px 16px;
-    background: rgba(255,255,255,0.05);
+    background: rgba(255,255,255,0.03);
     min-height: 92px;
-    color: #f8fafc;
 }
 .small-muted {
-    color: #b8c0cc;
+    color: #9aa0a6;
     font-size: 0.92rem;
     margin-bottom: 6px;
 }
@@ -75,7 +76,6 @@ h1, h2, h3 {
     font-size: 1.75rem;
     font-weight: 750;
     line-height: 1.2;
-    color: #f8fafc;
 }
 .big-number-small {
     font-size: 1.05rem;
@@ -83,7 +83,6 @@ h1, h2, h3 {
     line-height: 1.2;
     white-space: normal;
     word-break: break-word;
-    color: #f8fafc;
 }
 div[data-testid="stMetric"] {
     background: rgba(255,255,255,0.02);
@@ -103,8 +102,9 @@ div[data-testid="baseButton-secondary"] {
 # =========================================================
 # CONFIG
 # =========================================================
-EXPORT_CHUNK_ROWS = 500
-DB_INSERT_CHUNK = 40
+EXPORT_CHUNK_ROWS = 150
+DB_INSERT_CHUNK = 20
+EXPORT_INSERT_CHUNK = 4
 MAX_OPEN_ORDER_ROWS = 3000
 MAX_DUP_ROWS = 3000
 MAX_INVOICE_DETAIL_ROWS = 3000
@@ -249,20 +249,42 @@ def batched(seq, size=DB_INSERT_CHUNK):
         yield seq[i:i + size]
 
 
-def clear_caches():
-    load_active_upload_meta.clear()
-    load_metrics_map.clear()
-    load_table_records.clear()
-    load_export_df.clear()
+def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
+    sb = get_supabase()
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            sb.table(table_name).insert(chunk).execute()
+            return
+        except Exception as e:
+            last_error = e
+            wait_s = min(2 ** attempt, 8)
+            time.sleep(wait_s)
+
+    raise last_error
 
 
 def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INSERT_CHUNK):
     if not rows:
         return
-    sb = get_supabase()
-    for chunk in batched(rows, chunk_size):
-        sb.table(table_name).insert(chunk).execute()
 
+    for chunk in batched(rows, chunk_size):
+        try:
+            _insert_with_retry(table_name, chunk)
+        except Exception:
+            if len(chunk) <= 1:
+                raise
+
+            half = max(1, len(chunk) // 2)
+            for subchunk in batched(chunk, half):
+                try:
+                    _insert_with_retry(table_name, subchunk)
+                except Exception:
+                    if len(subchunk) <= 1:
+                        raise
+                    for one in subchunk:
+                        _insert_with_retry(table_name, [one], retries=3)
 
 def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
     sb = get_supabase()
@@ -335,9 +357,21 @@ def dataframe_to_export_chunks(df: pd.DataFrame) -> list[list[dict]]:
         row_dict = {col: normalize_value_for_json(row[col]) for col in df.columns}
         normalized_records.append(row_dict)
 
+    row_count = len(normalized_records)
+
+    if row_count >= 200000:
+        chunk_rows = 80
+    elif row_count >= 120000:
+        chunk_rows = 100
+    elif row_count >= 60000:
+        chunk_rows = 120
+    else:
+        chunk_rows = EXPORT_CHUNK_ROWS
+
     chunks = []
-    for i in range(0, len(normalized_records), EXPORT_CHUNK_ROWS):
-        chunks.append(normalized_records[i:i + EXPORT_CHUNK_ROWS])
+    for i in range(0, len(normalized_records), chunk_rows):
+        chunks.append(normalized_records[i:i + chunk_rows])
+
     return chunks
 
 
@@ -747,6 +781,9 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         progress.empty()
         return False, "Uploaded file is empty after removing blank rows."
 
+    if len(df) >= 120000:
+        st.warning(f"Large upload detected: {len(df):,} rows. Upload may take longer, but the app will use safer chunking automatically.")
+
     sb = get_supabase()
 
     upload_payload = {
@@ -776,7 +813,18 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
             })
 
         progress.progress(30, text="Saving export data...")
-        insert_in_chunks("dataset_export_chunks", export_rows, 20)
+
+        row_count = len(df)
+        if row_count >= 200000:
+            export_insert_chunk = 2
+        elif row_count >= 120000:
+            export_insert_chunk = 3
+        elif row_count >= 60000:
+            export_insert_chunk = 4
+        else:
+            export_insert_chunk = EXPORT_INSERT_CHUNK
+
+        insert_in_chunks("dataset_export_chunks", export_rows, export_insert_chunk)
 
         if dataset_key == "order_dashboard":
             progress.progress(45, text="Building order dashboard...")
@@ -829,37 +877,19 @@ def render_page_header(title: str, subtitle: str = ""):
 def render_local_time_card(uploaded_at: str):
     if not uploaded_at:
         html = """
-        <div style="
-            border: 1px solid rgba(140, 140, 140, 0.22);
-            border-radius: 16px;
-            padding: 14px 16px;
-            background: rgba(255,255,255,0.05);
-            min-height: 92px;
-            color: #f8fafc;
-            font-family: Arial, sans-serif;
-            box-sizing: border-box;
-        ">
-          <div style="color:#b8c0cc; font-size:0.92rem; margin-bottom:6px;">Updated at</div>
-          <div style="font-size:1.05rem; font-weight:750; line-height:1.2; color:#f8fafc;">-</div>
+        <div class="metric-card" style="min-height:92px;">
+          <div class="small-muted">Updated at</div>
+          <div class="big-number-small">-</div>
         </div>
         """
-        components.html(html, height=96)
+        st.markdown(html, unsafe_allow_html=True)
         return
 
     iso_str = str(uploaded_at)
     html = f"""
-    <div style="
-        border: 1px solid rgba(140, 140, 140, 0.22);
-        border-radius: 16px;
-        padding: 14px 16px;
-        background: rgba(255,255,255,0.05);
-        min-height: 92px;
-        color: #f8fafc;
-        font-family: Arial, sans-serif;
-        box-sizing: border-box;
-    ">
-      <div style="color:#b8c0cc; font-size:0.92rem; margin-bottom:6px;">Updated at</div>
-      <div id="local-updated-time" style="font-size:1.05rem; font-weight:750; line-height:1.2; color:#f8fafc;">Loading...</div>
+    <div class="metric-card" style="min-height:92px;">
+      <div class="small-muted">Updated at</div>
+      <div id="local-updated-time" class="big-number-small">Loading...</div>
     </div>
     <script>
       const iso = {iso_str!r};
@@ -879,6 +909,7 @@ def render_local_time_card(uploaded_at: str):
     </script>
     """
     components.html(html, height=96)
+
 
 def render_last_updated(upload_meta: dict | None):
     st.subheader("Last Updated")

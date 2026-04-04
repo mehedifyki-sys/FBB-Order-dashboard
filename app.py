@@ -304,17 +304,19 @@ def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
         .execute()
     )
     old_ids = [r["id"] for r in (resp.data or [])]
-    if old_ids:
-        sb.table("app_uploads").update({"is_active": False}).in_("id", old_ids).execute()
     return old_ids
 
 
 def delete_old_upload_related_data(old_upload_ids: list[int], dataset_key: str):
     if not old_upload_ids:
         return
+
     sb = get_supabase()
+
     for table_name in DATASETS[dataset_key]["cleanup_tables"]:
         sb.table(table_name).delete().in_("upload_id", old_upload_ids).execute()
+
+    sb.table("app_uploads").delete().in_("id", old_upload_ids).execute()
 
 
 def week_sort_parts(value):
@@ -789,26 +791,39 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         return False, "Uploaded file is empty after removing blank rows."
 
     if len(df) >= 120000:
-        st.warning(f"Large upload detected: {len(df):,} rows. Upload may take longer, but the app will use safer chunking automatically.")
+        st.warning(
+            f"Large upload detected: {len(df):,} rows. "
+            "Upload may take longer, but the app will use safer chunking automatically."
+        )
 
     sb = get_supabase()
 
-    upload_payload = {
-        "dataset_key": dataset_key,
-        "original_filename": uploaded_file.name,
-        "uploaded_by": admin_name,
-        "row_count": int(len(df)),
-        "column_order": list(df.columns),
-        "sheet_name": sheet_name,
-        "is_active": True,
-    }
-
     try:
-        progress.progress(5, text="Creating upload metadata...")
+        progress.progress(5, text="Checking old active data...")
+        old_resp = (
+            sb.table("app_uploads")
+            .select("id")
+            .eq("dataset_key", dataset_key)
+            .eq("is_active", True)
+            .execute()
+        )
+        old_upload_ids = [r["id"] for r in (old_resp.data or [])]
+
+        progress.progress(10, text="Creating upload metadata...")
+        upload_payload = {
+            "dataset_key": dataset_key,
+            "original_filename": uploaded_file.name,
+            "uploaded_by": admin_name,
+            "row_count": int(len(df)),
+            "column_order": list(df.columns),
+            "sheet_name": sheet_name,
+            "is_active": True,
+        }
+
         upload_resp = sb.table("app_uploads").insert(upload_payload).execute()
         upload_id = upload_resp.data[0]["id"]
 
-        progress.progress(15, text="Preparing export chunks...")
+        progress.progress(20, text="Preparing export chunks...")
         export_chunks = dataframe_to_export_chunks(df)
         export_rows = []
         for idx, chunk in enumerate(export_chunks):
@@ -856,12 +871,12 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
             insert_in_chunks("invoice_team_summary", team_rows, DB_INSERT_CHUNK)
             insert_in_chunks("invoice_detail_compact", compact_rows, DB_INSERT_CHUNK)
 
-        progress.progress(90, text="Cleaning previous active upload...")
-        old_upload_ids = deactivate_old_uploads(dataset_key, upload_id)
+        progress.progress(90, text="Removing old database data...")
         delete_old_upload_related_data(old_upload_ids, dataset_key)
 
         clear_caches()
         st.session_state.export_ready_for = None
+
         progress.progress(100, text="Upload complete.")
         progress.empty()
 

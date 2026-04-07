@@ -707,10 +707,27 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     for c in [x for x in numeric_cols if x]:
         work[c] = parse_numeric_series(work[c])
 
+    key_cols = [c for c in [sp_col, bd_col, cs_col] if c]
+    if key_cols:
+        key_frame = work[key_cols].fillna("").astype(str).apply(lambda s: s.str.strip())
+        joined_key = key_frame.apply(lambda row: "||".join([v for v in row if v]), axis=1)
+        work["_invoice_key"] = joined_key.where(joined_key.ne(""), work.index.astype(str))
+    else:
+        work["_invoice_key"] = work.index.astype(str)
+
     total_orders = float(work[num_orders_col].sum()) if num_orders_col else 0
     total_invoiced = float(work[num_invoiced_col].sum()) if num_invoiced_col else 0
     total_remaining = float(work[rem_orders_col].sum()) if rem_orders_col else 0
-    total_amount = float(work[total_amount_col].sum()) if total_amount_col else 0
+
+    if total_amount_col:
+        total_amount = float(
+            work.groupby("_invoice_key", dropna=False)[total_amount_col]
+            .max()
+            .fillna(0)
+            .sum()
+        )
+    else:
+        total_amount = 0
 
     metrics_rows = [
         {"upload_id": upload_id, "metric_key": "number_of_orders", "metric_num": total_orders, "metric_text": None},
@@ -899,22 +916,44 @@ def render_page_header(title: str, subtitle: str = ""):
 def render_local_time_card(uploaded_at: str):
     if not uploaded_at:
         html = """
-        <div class="metric-card" style="min-height:92px;">
-          <div class="small-muted">Updated at</div>
-          <div class="big-number-small">-</div>
+        <div style="
+            min-height:92px;
+            border:1px solid rgba(140, 140, 140, 0.22);
+            border-radius:16px;
+            padding:14px 16px;
+            background:rgba(255,255,255,0.03);
+            color:#f5f7fb;
+            display:flex;
+            flex-direction:column;
+            justify-content:center;
+        ">
+          <div style="color:#9aa0a6;font-size:0.92rem;margin-bottom:6px;">Updated at</div>
+          <div style="font-size:1.05rem;font-weight:750;line-height:1.2;color:#f5f7fb;">-</div>
         </div>
         """
-        st.markdown(html, unsafe_allow_html=True)
+        components.html(html, height=96)
         return
 
     iso_str = str(uploaded_at)
     html = f"""
-    <div class="metric-card" style="min-height:92px;">
-      <div class="small-muted">Updated at</div>
-      <div id="local-updated-time" class="big-number-small">Loading...</div>
+    <div style="
+        min-height:92px;
+        border:1px solid rgba(140, 140, 140, 0.22);
+        border-radius:16px;
+        padding:14px 16px;
+        background:rgba(255,255,255,0.03);
+        color:#f5f7fb;
+        display:flex;
+        flex-direction:column;
+        justify-content:center;
+        box-sizing:border-box;
+    ">
+      <div style="color:#9aa0a6;font-size:0.92rem;margin-bottom:6px;">Updated at</div>
+      <div id="local-updated-time" style="font-size:1.05rem;font-weight:750;line-height:1.2;color:#f5f7fb;white-space:normal;word-break:break-word;">Loading...</div>
     </div>
     <script>
       const iso = {iso_str!r};
+      const target = document.getElementById("local-updated-time");
       try {{
         const dt = new Date(iso);
         const txt = dt.toLocaleString(undefined, {{
@@ -924,13 +963,15 @@ def render_local_time_card(uploaded_at: str):
           hour: "2-digit",
           minute: "2-digit"
         }});
-        document.getElementById("local-updated-time").innerText = txt;
+        target.innerText = txt;
+        target.style.color = "#f5f7fb";
       }} catch (e) {{
-        document.getElementById("local-updated-time").innerText = iso;
+        target.innerText = iso;
+        target.style.color = "#f5f7fb";
       }}
     </script>
     """
-    components.html(html, height=96)
+    components.html(html, height=110)
 
 
 def render_last_updated(upload_meta: dict | None):

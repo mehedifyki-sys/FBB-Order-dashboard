@@ -4,7 +4,7 @@ import math
 import time
 import hashlib
 import hmac
-from datetime import date, datetime, time as dt_time
+import mimetypes
 from typing import Any
 
 import pandas as pd
@@ -103,14 +103,14 @@ div[data-testid="baseButton-secondary"] {
 # =========================================================
 # CONFIG
 # =========================================================
-EXPORT_CHUNK_ROWS = 120
-DB_INSERT_CHUNK = 10
-EXPORT_INSERT_CHUNK = 2
-RPC_CLEANUP_BATCH_SIZE = 300
+EXPORT_CHUNK_ROWS = 150
+DB_INSERT_CHUNK = 20
+EXPORT_INSERT_CHUNK = 4
 MAX_OPEN_ORDER_ROWS = 3000
 MAX_DUP_ROWS = 3000
 MAX_INVOICE_DETAIL_ROWS = 3000
 TOP_SHIPMENT_REF_CHART_ROWS = 50
+STORAGE_BUCKET = "dashboard-exports"
 
 DATASETS = {
     "order_dashboard": {
@@ -211,17 +211,6 @@ def normalize_value_for_json(value: Any):
         return None
     if isinstance(value, pd.Timestamp):
         return value.strftime("%Y-%m-%d")
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, dt_time):
-        return value.isoformat()
-    if hasattr(value, "isoformat") and not isinstance(value, str):
-        try:
-            return value.isoformat()
-        except Exception:
-            pass
     if isinstance(value, str):
         return normalize_date_like_text(value)
     return value
@@ -232,12 +221,6 @@ def safe_text(value: Any):
         return None
     if isinstance(value, pd.Timestamp):
         return value.strftime("%Y-%m-%d")
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, dt_time):
-        return value.isoformat()
     if isinstance(value, str):
         value = normalize_date_like_text(value)
         return None if value is None else str(value)
@@ -275,6 +258,40 @@ def clear_caches():
     load_export_df.clear()
 
 
+def make_storage_path(dataset_key: str, original_filename: str) -> str:
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", original_filename or "upload.xlsx").strip("._")
+    if not safe_name:
+        safe_name = "upload.xlsx"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"{dataset_key}/{timestamp}_{safe_name}"
+
+
+def upload_file_to_storage(bucket: str, path: str, file_bytes: bytes, original_filename: str):
+    sb = get_supabase()
+    content_type = mimetypes.guess_type(original_filename or "")[0] or "application/octet-stream"
+    sb.storage.from_(bucket).upload(
+        path=path,
+        file=file_bytes,
+        file_options={"content-type": content_type, "upsert": "false"},
+    )
+
+
+def download_export_bytes(storage_bucket: str, storage_path: str) -> bytes:
+    sb = get_supabase()
+    return sb.storage.from_(storage_bucket).download(storage_path)
+
+
+def delete_storage_objects(paths: list[str], bucket: str = STORAGE_BUCKET):
+    clean_paths = [p for p in paths if p]
+    if not clean_paths:
+        return
+    sb = get_supabase()
+    try:
+        sb.storage.from_(bucket).remove(clean_paths)
+    except Exception:
+        pass
+
+
 def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
     sb = get_supabase()
     last_error = None
@@ -291,22 +308,13 @@ def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
     raise last_error
 
 
-def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INSERT_CHUNK, pause_s: float = 0.0):
+def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INSERT_CHUNK):
     if not rows:
         return
 
-    total_rows = len(rows)
-    effective_chunk_size = max(1, chunk_size)
-
-    if table_name == "dataset_export_chunks":
-        if total_rows >= 1000:
-            effective_chunk_size = 1
-        elif total_rows >= 300:
-            effective_chunk_size = min(effective_chunk_size, 2)
-
-    for chunk in batched(rows, effective_chunk_size):
+    for chunk in batched(rows, chunk_size):
         try:
-            _insert_with_retry(table_name, chunk, retries=5)
+            _insert_with_retry(table_name, chunk)
         except Exception:
             if len(chunk) <= 1:
                 raise
@@ -314,14 +322,12 @@ def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INS
             half = max(1, len(chunk) // 2)
             for subchunk in batched(chunk, half):
                 try:
-                    _insert_with_retry(table_name, subchunk, retries=5)
+                    _insert_with_retry(table_name, subchunk)
                 except Exception:
                     if len(subchunk) <= 1:
                         raise
                     for one in subchunk:
-                        _insert_with_retry(table_name, [one], retries=5)
-        if pause_s > 0:
-            time.sleep(pause_s)
+                        _insert_with_retry(table_name, [one], retries=3)
 
 def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
     sb = get_supabase()
@@ -334,81 +340,19 @@ def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
         .execute()
     )
     old_ids = [r["id"] for r in (resp.data or [])]
-    if old_ids:
-        for chunk in batched(old_ids, 50):
-            sb.table("app_uploads").update({"is_active": False}).in_("id", chunk).execute()
-            time.sleep(0.05)
     return old_ids
 
 
-def cleanup_old_upload_related_data_rpc(dataset_key: str, keep_upload_id: int) -> tuple[bool, str]:
-    sb = get_supabase()
-    try:
-        resp = sb.rpc(
-            "cleanup_old_dataset_uploads",
-            {
-                "p_dataset_key": dataset_key,
-                "p_keep_upload_id": keep_upload_id,
-                "p_batch_size": RPC_CLEANUP_BATCH_SIZE,
-            },
-        ).execute()
-        data = resp.data
-        if isinstance(data, dict):
-            deleted_uploads = data.get("deleted_uploads", 0)
-            return True, f"Old versions removed: {deleted_uploads}"
-        return True, "Old versions removed."
-    except Exception as e:
-        return False, str(e)
-
-
-def cleanup_old_upload_related_data_inline(old_upload_ids: list[int], dataset_key: str):
+def delete_old_upload_related_data(old_upload_ids: list[int], dataset_key: str):
     if not old_upload_ids:
         return
 
     sb = get_supabase()
 
     for table_name in DATASETS[dataset_key]["cleanup_tables"]:
-        while True:
-            resp = (
-                sb.table(table_name)
-                .select("id")
-                .in_("upload_id", old_upload_ids)
-                .order("id")
-                .limit(RPC_CLEANUP_BATCH_SIZE)
-                .execute()
-            )
-            ids = [row["id"] for row in (resp.data or []) if row.get("id") is not None]
-            if not ids:
-                break
-            sb.table(table_name).delete().in_("id", ids).execute()
-            time.sleep(0.05)
+        sb.table(table_name).delete().in_("upload_id", old_upload_ids).execute()
 
-    while True:
-        resp = (
-            sb.table("app_uploads")
-            .select("id")
-            .in_("id", old_upload_ids)
-            .order("id")
-            .limit(RPC_CLEANUP_BATCH_SIZE)
-            .execute()
-        )
-        ids = [row["id"] for row in (resp.data or []) if row.get("id") is not None]
-        if not ids:
-            break
-        sb.table("app_uploads").delete().in_("id", ids).execute()
-        time.sleep(0.05)
-
-
-def cleanup_old_upload_related_data(old_upload_ids: list[int], dataset_key: str, keep_upload_id: int):
-    ok, msg = cleanup_old_upload_related_data_rpc(dataset_key, keep_upload_id)
-    if ok:
-        return True, msg
-
-    if old_upload_ids:
-        cleanup_old_upload_related_data_inline(old_upload_ids, dataset_key)
-        return True, "Old versions removed with inline cleanup."
-
-    return False, msg
+    sb.table("app_uploads").delete().in_("id", old_upload_ids).execute()
 
 
 def week_sort_parts(value):
@@ -484,7 +428,7 @@ def load_active_upload_meta(dataset_key: str):
     sb = get_supabase()
     resp = (
         sb.table("app_uploads")
-        .select("id,dataset_key,original_filename,uploaded_by,uploaded_at,row_count,column_order,sheet_name,is_active")
+        .select("id,dataset_key,original_filename,uploaded_by,uploaded_at,row_count,column_order,sheet_name,is_active,storage_bucket,storage_path")
         .eq("dataset_key", dataset_key)
         .eq("is_active", True)
         .order("id", desc=True)
@@ -525,7 +469,18 @@ def load_table_records(table_name: str, upload_id: int, limit_rows: int | None =
 
 
 @st.cache_data(ttl=60)
-def load_export_df(upload_id: int, column_order: tuple):
+def load_export_df(upload_id: int, column_order: tuple, storage_bucket: str | None = None, storage_path: str | None = None):
+    if storage_bucket and storage_path:
+        file_bytes = download_export_bytes(storage_bucket, storage_path)
+        bio = io.BytesIO(file_bytes)
+        export_df = pd.read_excel(bio, dtype=object)
+        export_df.columns = [str(c).strip() for c in export_df.columns]
+        ordered_cols = [c for c in column_order if c in export_df.columns]
+        extra_cols = [c for c in export_df.columns if c not in ordered_cols]
+        if len(export_df.columns) > 0:
+            export_df = export_df[ordered_cols + extra_cols]
+        return clean_export_dataframe(export_df)
+
     sb = get_supabase()
 
     all_chunks = []
@@ -886,10 +841,12 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
 
     try:
         uploaded_file.seek(0)
-        excel = pd.ExcelFile(uploaded_file)
+        file_bytes = uploaded_file.read()
+        bio = io.BytesIO(file_bytes)
+        excel = pd.ExcelFile(bio)
         sheet_name = excel.sheet_names[0]
-        uploaded_file.seek(0)
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        bio.seek(0)
+        df = pd.read_excel(bio, sheet_name=sheet_name, dtype=object)
     except Exception as e:
         progress.empty()
         return False, f"Could not read Excel file: {e}"
@@ -904,23 +861,28 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     if len(df) >= 120000:
         st.warning(
             f"Large upload detected: {len(df):,} rows. "
-            "Upload may take longer, but the app will use safer chunking automatically."
+            "Upload time is reduced because the original file is stored directly in Supabase Storage instead of chunking every row into the database."
         )
 
     sb = get_supabase()
 
     try:
-        progress.progress(5, text="Checking current active data...")
+        progress.progress(5, text="Checking old active data...")
         old_resp = (
             sb.table("app_uploads")
-            .select("id")
+            .select("id,storage_path")
             .eq("dataset_key", dataset_key)
             .eq("is_active", True)
             .execute()
         )
-        old_upload_ids = [r["id"] for r in (old_resp.data or [])]
+        old_uploads = old_resp.data or []
+        old_upload_ids = [r["id"] for r in old_uploads]
 
-        progress.progress(10, text="Creating upload metadata...")
+        progress.progress(12, text="Uploading source file to Storage...")
+        storage_path = make_storage_path(dataset_key, uploaded_file.name)
+        upload_file_to_storage(STORAGE_BUCKET, storage_path, file_bytes, uploaded_file.name)
+
+        progress.progress(22, text="Creating upload metadata...")
         upload_payload = {
             "dataset_key": dataset_key,
             "original_filename": uploaded_file.name,
@@ -929,65 +891,55 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
             "column_order": list(df.columns),
             "sheet_name": sheet_name,
             "is_active": True,
+            "storage_bucket": STORAGE_BUCKET,
+            "storage_path": storage_path,
         }
 
         upload_resp = sb.table("app_uploads").insert(upload_payload).execute()
         upload_id = upload_resp.data[0]["id"]
 
-        progress.progress(14, text="Deactivating previous version...")
-        deactivate_old_uploads(dataset_key, upload_id)
-
-        progress.progress(20, text="Preparing export chunks...")
-        export_chunks = dataframe_to_export_chunks(df)
-        export_rows = []
-        for idx, chunk in enumerate(export_chunks):
-            export_rows.append({
-                "upload_id": upload_id,
-                "chunk_index": idx,
-                "row_count": len(chunk),
-                "chunk_data": chunk,
-            })
-
-        progress.progress(30, text="Saving export data...")
-
-        row_count = len(df)
-        if row_count >= 120000:
-            export_insert_chunk = 1
-            export_pause = 0.03
-        elif row_count >= 60000:
-            export_insert_chunk = 1
-            export_pause = 0.02
-        else:
-            export_insert_chunk = EXPORT_INSERT_CHUNK
-            export_pause = 0.0
-
-        insert_in_chunks("dataset_export_chunks", export_rows, export_insert_chunk, pause_s=export_pause)
+        if old_upload_ids:
+            progress.progress(28, text="Marking previous upload inactive...")
+            sb.table("app_uploads").update({"is_active": False}).in_("id", old_upload_ids).execute()
 
         if dataset_key == "order_dashboard":
-            progress.progress(55, text="Building order dashboard...")
+            progress.progress(42, text="Building order dashboard...")
             metrics_rows, weekly_rows, open_rows, duplicate_rows = build_order_dashboard_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("order_weekly_summary", weekly_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("order_open_orders", open_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("order_duplicate_lines", duplicate_rows, DB_INSERT_CHUNK, pause_s=0.01)
+            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("order_weekly_summary", weekly_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("order_open_orders", open_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("order_duplicate_lines", duplicate_rows, DB_INSERT_CHUNK)
 
         elif dataset_key == "fbb_shipment_details":
-            progress.progress(55, text="Building shipment dashboard...")
+            progress.progress(42, text="Building shipment dashboard...")
             metrics_rows, month_rows, ref_summary_rows = build_shipment_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("shipment_month_summary", month_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("shipment_ref_summary", ref_summary_rows, DB_INSERT_CHUNK, pause_s=0.01)
+            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("shipment_month_summary", month_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("shipment_ref_summary", ref_summary_rows, DB_INSERT_CHUNK)
 
         elif dataset_key == "fbb_invoice_status":
-            progress.progress(55, text="Building invoice dashboard...")
+            progress.progress(42, text="Building invoice dashboard...")
             metrics_rows, status_rows, team_rows, compact_rows = build_invoice_data(df, upload_id)
-            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("invoice_status_summary", status_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("invoice_team_summary", team_rows, DB_INSERT_CHUNK, pause_s=0.01)
-            insert_in_chunks("invoice_detail_compact", compact_rows, DB_INSERT_CHUNK, pause_s=0.01)
+            insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("invoice_status_summary", status_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("invoice_team_summary", team_rows, DB_INSERT_CHUNK)
+            insert_in_chunks("invoice_detail_compact", compact_rows, DB_INSERT_CHUNK)
 
-        progress.progress(92, text="Deleting previous database data...")
-        cleanup_ok, cleanup_msg = cleanup_old_upload_related_data(old_upload_ids, dataset_key, upload_id)
+        if old_upload_ids:
+            progress.progress(88, text="Deleting old data in server-side batches...")
+            try:
+                sb.rpc(
+                    "cleanup_old_dataset_uploads",
+                    {
+                        "p_dataset_key": dataset_key,
+                        "p_keep_upload_id": upload_id,
+                        "p_batch_size": 300,
+                    },
+                ).execute()
+            except Exception:
+                pass
+
+            delete_storage_objects([r.get("storage_path") for r in old_uploads if r.get("storage_path")], STORAGE_BUCKET)
 
         clear_caches()
         st.session_state.export_ready_for = None
@@ -995,9 +947,7 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         progress.progress(100, text="Upload complete.")
         progress.empty()
 
-        if cleanup_ok:
-            return True, f"{DATASETS[dataset_key]['label']} uploaded successfully. Rows: {len(df):,}. {cleanup_msg}"
-        return False, f"New data uploaded, but previous data cleanup failed: {cleanup_msg}"
+        return True, f"{DATASETS[dataset_key]['label']} uploaded successfully. Rows: {len(df):,}"
 
     except Exception as e:
         progress.empty()
@@ -1162,7 +1112,7 @@ def render_export_section(dataset_key: str, upload_meta: dict | None):
     with dl_col:
         if st.session_state.export_ready_for == dataset_key:
             with st.spinner("Preparing export..."):
-                export_df = load_export_df(upload_id, column_order)
+                export_df = load_export_df(upload_id, column_order, upload_meta.get("storage_bucket"), upload_meta.get("storage_path"))
                 export_bytes = excel_bytes_from_df(export_df, sheet_name)
 
             st.download_button(

@@ -102,9 +102,9 @@ div[data-testid="baseButton-secondary"] {
 # =========================================================
 # CONFIG
 # =========================================================
-EXPORT_CHUNK_ROWS = 150
-DB_INSERT_CHUNK = 20
-EXPORT_INSERT_CHUNK = 4
+EXPORT_CHUNK_ROWS = 80
+DB_INSERT_CHUNK = 10
+EXPORT_INSERT_CHUNK = 1
 MAX_OPEN_ORDER_ROWS = 3000
 MAX_DUP_ROWS = 3000
 MAX_INVOICE_DETAIL_ROWS = 3000
@@ -256,17 +256,18 @@ def clear_caches():
     load_export_df.clear()
 
 
-def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
+def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 5):
     sb = get_supabase()
     last_error = None
 
     for attempt in range(retries):
         try:
             sb.table(table_name).insert(chunk).execute()
+            time.sleep(0.12)
             return
         except Exception as e:
             last_error = e
-            wait_s = min(2 ** attempt, 8)
+            wait_s = min((2 ** attempt) + 0.5, 10)
             time.sleep(wait_s)
 
     raise last_error
@@ -291,7 +292,7 @@ def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INS
                     if len(subchunk) <= 1:
                         raise
                     for one in subchunk:
-                        _insert_with_retry(table_name, [one], retries=3)
+                        _insert_with_retry(table_name, [one], retries=5)
 
 def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
     sb = get_supabase()
@@ -369,11 +370,11 @@ def dataframe_to_export_chunks(df: pd.DataFrame) -> list[list[dict]]:
     row_count = len(normalized_records)
 
     if row_count >= 200000:
-        chunk_rows = 80
+        chunk_rows = 40
     elif row_count >= 120000:
-        chunk_rows = 100
+        chunk_rows = 50
     elif row_count >= 60000:
-        chunk_rows = 120
+        chunk_rows = 60
     else:
         chunk_rows = EXPORT_CHUNK_ROWS
 
@@ -793,9 +794,11 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     progress = st.progress(0, text="Reading file...")
 
     try:
+        uploaded_file.seek(0)
         excel = pd.ExcelFile(uploaded_file)
         sheet_name = excel.sheet_names[0]
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
+        uploaded_file.seek(0)
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=object)
     except Exception as e:
         progress.empty()
         return False, f"Could not read Excel file: {e}"
@@ -855,11 +858,11 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
 
         row_count = len(df)
         if row_count >= 200000:
-            export_insert_chunk = 2
+            export_insert_chunk = 1
         elif row_count >= 120000:
-            export_insert_chunk = 3
+            export_insert_chunk = 1
         elif row_count >= 60000:
-            export_insert_chunk = 4
+            export_insert_chunk = 1
         else:
             export_insert_chunk = EXPORT_INSERT_CHUNK
 
@@ -894,6 +897,7 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         clear_caches()
         st.session_state.export_ready_for = None
 
+        time.sleep(0.2)
         progress.progress(100, text="Upload complete.")
         progress.empty()
 

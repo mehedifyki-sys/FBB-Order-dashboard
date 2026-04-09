@@ -5,6 +5,7 @@ import time
 import hashlib
 import hmac
 from typing import Any
+from datetime import datetime, date, time as dt_time
 
 import pandas as pd
 import plotly.express as px
@@ -102,9 +103,9 @@ div[data-testid="baseButton-secondary"] {
 # =========================================================
 # CONFIG
 # =========================================================
-EXPORT_CHUNK_ROWS = 80
-DB_INSERT_CHUNK = 10
-EXPORT_INSERT_CHUNK = 1
+EXPORT_CHUNK_ROWS = 150
+DB_INSERT_CHUNK = 20
+EXPORT_INSERT_CHUNK = 4
 MAX_OPEN_ORDER_ROWS = 3000
 MAX_DUP_ROWS = 3000
 MAX_INVOICE_DETAIL_ROWS = 3000
@@ -192,7 +193,24 @@ def normalize_date_like_text(value: Any):
         return None
 
     if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            return None
         return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+
+    if isinstance(value, dt_time):
+        return value.strftime("%H:%M:%S")
+
+    if hasattr(value, "isoformat") and type(value).__module__.startswith("numpy"):
+        try:
+            return pd.to_datetime(value).strftime("%Y-%m-%d")
+        except Exception:
+            pass
 
     if isinstance(value, str):
         text = value.strip()
@@ -205,24 +223,33 @@ def normalize_date_like_text(value: Any):
 
 
 def normalize_value_for_json(value: Any):
-    if pd.isna(value):
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+
+    value = normalize_date_like_text(value)
+
+    if value is None:
         return None
-    if isinstance(value, pd.Timestamp):
-        return value.strftime("%Y-%m-%d")
-    if isinstance(value, str):
-        return normalize_date_like_text(value)
-    return value
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): normalize_value_for_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [normalize_value_for_json(v) for v in value]
+    return str(value)
 
 
 def safe_text(value: Any):
-    if pd.isna(value):
-        return None
-    if isinstance(value, pd.Timestamp):
-        return value.strftime("%Y-%m-%d")
-    if isinstance(value, str):
-        value = normalize_date_like_text(value)
-        return None if value is None else str(value)
-    return str(value)
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    value = normalize_date_like_text(value)
+    return None if value is None else str(value)
 
 
 def safe_num(value: Any):
@@ -256,7 +283,7 @@ def clear_caches():
     load_export_df.clear()
 
 
-def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 5):
+def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
     sb = get_supabase()
     last_error = None
 
@@ -267,7 +294,7 @@ def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 5):
             return
         except Exception as e:
             last_error = e
-            wait_s = min((2 ** attempt) + 0.5, 10)
+            wait_s = min(2 ** attempt, 8)
             time.sleep(wait_s)
 
     raise last_error
@@ -292,7 +319,7 @@ def insert_in_chunks(table_name: str, rows: list[dict], chunk_size: int = DB_INS
                     if len(subchunk) <= 1:
                         raise
                     for one in subchunk:
-                        _insert_with_retry(table_name, [one], retries=5)
+                        _insert_with_retry(table_name, [one], retries=3)
 
 def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
     sb = get_supabase()
@@ -370,11 +397,11 @@ def dataframe_to_export_chunks(df: pd.DataFrame) -> list[list[dict]]:
     row_count = len(normalized_records)
 
     if row_count >= 200000:
-        chunk_rows = 40
+        chunk_rows = 80
     elif row_count >= 120000:
-        chunk_rows = 50
+        chunk_rows = 100
     elif row_count >= 60000:
-        chunk_rows = 60
+        chunk_rows = 120
     else:
         chunk_rows = EXPORT_CHUNK_ROWS
 
@@ -794,11 +821,13 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     progress = st.progress(0, text="Reading file...")
 
     try:
-        uploaded_file.seek(0)
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
         excel = pd.ExcelFile(uploaded_file)
         sheet_name = excel.sheet_names[0]
-        uploaded_file.seek(0)
-        df = pd.read_excel(uploaded_file, sheet_name=sheet_name, dtype=object)
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
     except Exception as e:
         progress.empty()
         return False, f"Could not read Excel file: {e}"
@@ -858,11 +887,11 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
 
         row_count = len(df)
         if row_count >= 200000:
-            export_insert_chunk = 1
+            export_insert_chunk = 2
         elif row_count >= 120000:
-            export_insert_chunk = 1
+            export_insert_chunk = 3
         elif row_count >= 60000:
-            export_insert_chunk = 1
+            export_insert_chunk = 4
         else:
             export_insert_chunk = EXPORT_INSERT_CHUNK
 
@@ -897,7 +926,6 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         clear_caches()
         st.session_state.export_ready_for = None
 
-        time.sleep(0.2)
         progress.progress(100, text="Upload complete.")
         progress.empty()
 

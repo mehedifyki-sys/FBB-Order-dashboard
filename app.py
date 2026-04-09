@@ -102,9 +102,9 @@ div[data-testid="baseButton-secondary"] {
 # =========================================================
 # CONFIG
 # =========================================================
-EXPORT_CHUNK_ROWS = 150
-DB_INSERT_CHUNK = 20
-EXPORT_INSERT_CHUNK = 4
+EXPORT_CHUNK_ROWS = 40
+DB_INSERT_CHUNK = 10
+EXPORT_INSERT_CHUNK = 1
 MAX_OPEN_ORDER_ROWS = 3000
 MAX_DUP_ROWS = 3000
 MAX_INVOICE_DETAIL_ROWS = 3000
@@ -256,17 +256,19 @@ def clear_caches():
     load_export_df.clear()
 
 
-def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
+def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 6):
     sb = get_supabase()
     last_error = None
 
     for attempt in range(retries):
         try:
             sb.table(table_name).insert(chunk).execute()
+            if table_name == "dataset_export_chunks":
+                time.sleep(0.12)
             return
         except Exception as e:
             last_error = e
-            wait_s = min(2 ** attempt, 8)
+            wait_s = min(2 ** attempt, 12)
             time.sleep(wait_s)
 
     raise last_error
@@ -304,19 +306,52 @@ def deactivate_old_uploads(dataset_key: str, new_upload_id: int) -> list[int]:
         .execute()
     )
     old_ids = [r["id"] for r in (resp.data or [])]
+    if old_ids:
+        sb.table("app_uploads").update({"is_active": False}).in_("id", old_ids).execute()
     return old_ids
 
 
 def delete_old_upload_related_data(old_upload_ids: list[int], dataset_key: str):
-    if not old_upload_ids:
-        return
+    # Intentionally no-op during upload. Hard-deleting historical chunk rows is the
+    # main source of statement timeouts for very large uploads. We keep old versions
+    # inactive so the newest active upload is used immediately.
+    return
 
+
+def cleanup_inactive_uploads(dataset_key: str):
     sb = get_supabase()
+    resp = (
+        sb.table("app_uploads")
+        .select("id")
+        .eq("dataset_key", dataset_key)
+        .eq("is_active", False)
+        .order("id")
+        .execute()
+    )
+    old_ids = [int(r["id"]) for r in (resp.data or []) if r.get("id") is not None]
 
-    for table_name in DATASETS[dataset_key]["cleanup_tables"]:
-        sb.table(table_name).delete().in_("upload_id", old_upload_ids).execute()
+    if not old_ids:
+        return True, "No previous inactive data found to delete."
 
-    sb.table("app_uploads").delete().in_("id", old_upload_ids).execute()
+    total_deleted_versions = len(old_ids)
+    batch_size = 5
+
+    try:
+        for table_name in DATASETS[dataset_key]["cleanup_tables"]:
+            for i in range(0, len(old_ids), batch_size):
+                id_batch = old_ids[i:i + batch_size]
+                sb.table(table_name).delete().in_("upload_id", id_batch).execute()
+                time.sleep(0.2)
+
+        for i in range(0, len(old_ids), batch_size):
+            id_batch = old_ids[i:i + batch_size]
+            sb.table("app_uploads").delete().in_("id", id_batch).execute()
+            time.sleep(0.2)
+
+        clear_caches()
+        return True, f"Previous data deleted successfully. Removed {total_deleted_versions} old upload version(s)."
+    except Exception as e:
+        return False, f"Previous data delete failed: {e}"
 
 
 def week_sort_parts(value):
@@ -368,12 +403,10 @@ def dataframe_to_export_chunks(df: pd.DataFrame) -> list[list[dict]]:
 
     row_count = len(normalized_records)
 
-    if row_count >= 200000:
-        chunk_rows = 80
-    elif row_count >= 120000:
-        chunk_rows = 100
+    if row_count >= 120000:
+        chunk_rows = 15
     elif row_count >= 60000:
-        chunk_rows = 120
+        chunk_rows = 25
     else:
         chunk_rows = EXPORT_CHUNK_ROWS
 
@@ -793,8 +826,12 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     progress = st.progress(0, text="Reading file...")
 
     try:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
         excel = pd.ExcelFile(uploaded_file)
         sheet_name = excel.sheet_names[0]
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
     except Exception as e:
         progress.empty()
@@ -854,12 +891,10 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         progress.progress(30, text="Saving export data...")
 
         row_count = len(df)
-        if row_count >= 200000:
-            export_insert_chunk = 2
-        elif row_count >= 120000:
-            export_insert_chunk = 3
+        if row_count >= 120000:
+            export_insert_chunk = 1
         elif row_count >= 60000:
-            export_insert_chunk = 4
+            export_insert_chunk = 1
         else:
             export_insert_chunk = EXPORT_INSERT_CHUNK
 
@@ -888,7 +923,8 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
             insert_in_chunks("invoice_team_summary", team_rows, DB_INSERT_CHUNK)
             insert_in_chunks("invoice_detail_compact", compact_rows, DB_INSERT_CHUNK)
 
-        progress.progress(90, text="Removing old database data...")
+        progress.progress(90, text="Switching active dataset...")
+        deactivate_old_uploads(dataset_key, upload_id)
         delete_old_upload_related_data(old_upload_ids, dataset_key)
 
         clear_caches()
@@ -1039,6 +1075,16 @@ def render_admin_upload_section(dataset_key: str):
                     st.rerun()
                 else:
                     st.error(msg)
+
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    if st.button("Delete Previous Data", key=f"delete_previous_{dataset_key}"):
+        with st.spinner("Deleting previous inactive data..."):
+            ok, msg = cleanup_inactive_uploads(dataset_key)
+        if ok:
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
 
 
 def render_export_section(dataset_key: str, upload_meta: dict | None):

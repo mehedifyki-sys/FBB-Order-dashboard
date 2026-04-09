@@ -5,7 +5,6 @@ import time
 import hashlib
 import hmac
 from typing import Any
-from datetime import datetime, date, time as dt_time
 
 import pandas as pd
 import plotly.express as px
@@ -193,24 +192,7 @@ def normalize_date_like_text(value: Any):
         return None
 
     if isinstance(value, pd.Timestamp):
-        if pd.isna(value):
-            return None
         return value.strftime("%Y-%m-%d")
-
-    if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d")
-
-    if isinstance(value, date):
-        return value.strftime("%Y-%m-%d")
-
-    if isinstance(value, dt_time):
-        return value.strftime("%H:%M:%S")
-
-    if hasattr(value, "isoformat") and type(value).__module__.startswith("numpy"):
-        try:
-            return pd.to_datetime(value).strftime("%Y-%m-%d")
-        except Exception:
-            pass
 
     if isinstance(value, str):
         text = value.strip()
@@ -223,33 +205,24 @@ def normalize_date_like_text(value: Any):
 
 
 def normalize_value_for_json(value: Any):
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-
-    value = normalize_date_like_text(value)
-
-    if value is None:
+    if pd.isna(value):
         return None
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, dict):
-        return {str(k): normalize_value_for_json(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [normalize_value_for_json(v) for v in value]
-    return str(value)
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, str):
+        return normalize_date_like_text(value)
+    return value
 
 
 def safe_text(value: Any):
-    try:
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    value = normalize_date_like_text(value)
-    return None if value is None else str(value)
+    if pd.isna(value):
+        return None
+    if isinstance(value, pd.Timestamp):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, str):
+        value = normalize_date_like_text(value)
+        return None if value is None else str(value)
+    return str(value)
 
 
 def safe_num(value: Any):
@@ -290,7 +263,6 @@ def _insert_with_retry(table_name: str, chunk: list[dict], retries: int = 4):
     for attempt in range(retries):
         try:
             sb.table(table_name).insert(chunk).execute()
-            time.sleep(0.12)
             return
         except Exception as e:
             last_error = e
@@ -821,12 +793,8 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     progress = st.progress(0, text="Reading file...")
 
     try:
-        if hasattr(uploaded_file, "seek"):
-            uploaded_file.seek(0)
         excel = pd.ExcelFile(uploaded_file)
         sheet_name = excel.sheet_names[0]
-        if hasattr(uploaded_file, "seek"):
-            uploaded_file.seek(0)
         df = pd.read_excel(uploaded_file, sheet_name=sheet_name)
     except Exception as e:
         progress.empty()

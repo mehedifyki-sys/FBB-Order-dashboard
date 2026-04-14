@@ -5,6 +5,7 @@ import time
 import hashlib
 import hmac
 import mimetypes
+from copy import copy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +15,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
+from openpyxl import load_workbook
 
 
 # =========================================================
@@ -470,8 +472,6 @@ def load_table_records(table_name: str, upload_id: int, limit_rows: int | None =
 
 
 @st.cache_data(ttl=60)
-
-@st.cache_data(ttl=60)
 def load_export_df(upload_id: int, column_order: tuple, storage_bucket: str | None = None, storage_path: str | None = None):
     if storage_bucket and storage_path:
         file_bytes = download_export_bytes(storage_bucket, storage_path)
@@ -573,46 +573,49 @@ def clean_invoice_summary_sheet(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def append_invoice_grand_total_row(df: pd.DataFrame) -> pd.DataFrame:
-    clean_df = clean_invoice_summary_sheet(df)
-    if clean_df.empty:
-        return clean_df
-
-    total_columns = [
-        "Number of Orders",
-        "Number of Invoiced Orders",
-        "Remaining Orders to Invoice",
-        "Total Qty Shipped",
-        "Total Amount",
-        "Invoiced Qty",
-        "Remaining Qty to invoice",
-        "Remaining Amount to invoice",
-        "#Days",
-    ]
-
-    grand_row = {col: None for col in clean_df.columns}
-    label_col = first_existing_column(clean_df, ["SP#", "BD Ref#", "CS Ref#"]) or clean_df.columns[0]
-    grand_row[label_col] = "Grand Total"
-
-    for col in total_columns:
-        if col in clean_df.columns:
-            total_val = pd.to_numeric(clean_df[col], errors="coerce").fillna(0).sum()
-            if pd.notna(total_val):
-                total_float = float(total_val)
-                grand_row[col] = int(round(total_float)) if abs(total_float - round(total_float)) < 1e-9 else total_float
-
-    return pd.concat([clean_df, pd.DataFrame([grand_row])], ignore_index=True)
+def find_last_nonempty_excel_row(ws) -> int:
+    for row_idx in range(ws.max_row, 0, -1):
+        for col_idx in range(1, ws.max_column + 1):
+            value = ws.cell(row=row_idx, column=col_idx).value
+            if value is not None and str(value).strip() != "":
+                return row_idx
+    return 1
 
 
-def excel_bytes_from_workbook_sheets(sheets: dict[str, pd.DataFrame]) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl", datetime_format="YYYY-MM-DD") as writer:
-        for idx, (sheet_name, sheet_df) in enumerate(sheets.items()):
-            write_name = (sheet_name[:31] if sheet_name else f"Sheet{idx + 1}")
-            clean_df = clean_export_dataframe(sheet_df.copy())
-            clean_df.to_excel(writer, index=False, sheet_name=write_name)
-    output.seek(0)
-    return output.getvalue()
+def find_grand_total_excel_row(ws) -> int | None:
+    for row_idx in range(1, ws.max_row + 1):
+        row_values = [ws.cell(row=row_idx, column=col_idx).value for col_idx in range(1, ws.max_column + 1)]
+        if any(is_grand_total_text(v) for v in row_values):
+            return row_idx
+    return None
+
+
+def copy_excel_row_style(ws, source_row: int, target_row: int):
+    if source_row <= 0 or target_row <= 0:
+        return
+
+    for col_idx in range(1, ws.max_column + 1):
+        source_cell = ws.cell(row=source_row, column=col_idx)
+        target_cell = ws.cell(row=target_row, column=col_idx)
+
+        if source_cell.has_style:
+            target_cell._style = copy(source_cell._style)
+        if source_cell.number_format:
+            target_cell.number_format = source_cell.number_format
+        if source_cell.font:
+            target_cell.font = copy(source_cell.font)
+        if source_cell.fill:
+            target_cell.fill = copy(source_cell.fill)
+        if source_cell.border:
+            target_cell.border = copy(source_cell.border)
+        if source_cell.alignment:
+            target_cell.alignment = copy(source_cell.alignment)
+        if source_cell.protection:
+            target_cell.protection = copy(source_cell.protection)
+
+    if source_row in ws.row_dimensions:
+        ws.row_dimensions[target_row].height = ws.row_dimensions[source_row].height
+        ws.row_dimensions[target_row].hidden = ws.row_dimensions[source_row].hidden
 
 
 def build_invoice_status_export_bytes(upload_meta: dict) -> bytes:
@@ -624,23 +627,73 @@ def build_invoice_status_export_bytes(upload_meta: dict) -> bytes:
         column_order = tuple(upload_meta.get("column_order", []) or [])
         sheet_name = upload_meta.get("sheet_name", "FBB Summary")
         export_df = load_export_df(upload_id, column_order, None, None)
-        export_df = append_invoice_grand_total_row(export_df)
         return excel_bytes_from_df(export_df, sheet_name)
 
-    original_sheets = load_workbook_sheets(storage_bucket, storage_path)
-    if not original_sheets:
-        return download_export_bytes(storage_bucket, storage_path)
+    original_bytes = download_export_bytes(storage_bucket, storage_path)
+    wb = load_workbook(io.BytesIO(original_bytes))
+    if not wb.worksheets:
+        return original_bytes
 
-    rebuilt_sheets = {}
-    first_sheet_done = False
-    for sheet_name, sheet_df in original_sheets.items():
-        if not first_sheet_done:
-            rebuilt_sheets[sheet_name] = append_invoice_grand_total_row(sheet_df)
-            first_sheet_done = True
+    ws = wb.worksheets[0]
+    header_row = 1
+    data_start_row = 2
+
+    grand_total_row = find_grand_total_excel_row(ws)
+    if grand_total_row:
+        data_end_row = grand_total_row - 1
+        target_total_row = grand_total_row
+    else:
+        last_nonempty_row = find_last_nonempty_excel_row(ws)
+        data_end_row = last_nonempty_row
+        target_total_row = last_nonempty_row + 1
+        ws.insert_rows(target_total_row, 1)
+
+    if data_end_row < data_start_row:
+        data_end_row = data_start_row - 1
+
+    style_source_row = grand_total_row or max(data_end_row, header_row)
+    copy_excel_row_style(ws, style_source_row, target_total_row)
+
+    headers = {}
+    for col_idx in range(1, ws.max_column + 1):
+        header_value = ws.cell(row=header_row, column=col_idx).value
+        if header_value is not None:
+            headers[str(header_value).strip()] = col_idx
+
+    total_columns = [
+        "Number of Orders",
+        "Number of Invoiced Orders",
+        "Remaining Orders to Invoice",
+        "Total Qty Shipped",
+        "Total Amount",
+        "Invoiced Qty",
+        "Remaining Qty to invoice",
+        "Remaining Amount to invoice",
+    ]
+
+    label_col_name = next((name for name in ["SP#", "BD Ref#", "CS Ref#"] if name in headers), None)
+    label_col_idx = headers.get(label_col_name, 1)
+
+    for col_idx in range(1, ws.max_column + 1):
+        ws.cell(row=target_total_row, column=col_idx).value = None
+
+    ws.cell(row=target_total_row, column=label_col_idx).value = "Grand Total"
+
+    for column_name in total_columns:
+        col_idx = headers.get(column_name)
+        if not col_idx:
+            continue
+
+        col_letter = ws.cell(row=header_row, column=col_idx).column_letter
+        if data_end_row >= data_start_row:
+            ws.cell(row=target_total_row, column=col_idx).value = f"=SUM({col_letter}{data_start_row}:{col_letter}{data_end_row})"
         else:
-            rebuilt_sheets[sheet_name] = sheet_df.copy()
+            ws.cell(row=target_total_row, column=col_idx).value = 0
 
-    return excel_bytes_from_workbook_sheets(rebuilt_sheets)
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
 
 
 def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):

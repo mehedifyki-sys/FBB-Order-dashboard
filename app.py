@@ -750,6 +750,7 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
 
 
 
+
 def build_invoice_data(df: pd.DataFrame, upload_id: int):
     num_orders_col = first_existing_column(df, ["Number of Orders"])
     num_invoiced_col = first_existing_column(df, ["Number of Invoiced Orders"])
@@ -777,33 +778,73 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     for c in [x for x in numeric_cols if x]:
         work[c] = parse_numeric_series(work[c])
 
-    id_cols = [c for c in [sp_col, bd_col, cs_col] if c]
+    def _row_text(row: pd.Series) -> str:
+        parts = []
+        for v in row.tolist():
+            if pd.isna(v):
+                continue
+            parts.append(str(v).strip().lower())
+        return " | ".join(parts)
+
+    # Detect workbook-provided grand total row and use it directly.
+    grand_total_mask = work.apply(lambda row: "grand-total" in _row_text(row) or "grand total" in _row_text(row), axis=1)
+    has_grand_total = bool(grand_total_mask.any())
+
+    # Remove blank separator rows and grand-total rows from detail-level processing.
+    detail_df = work.loc[~grand_total_mask].copy()
+    detail_df = detail_df.dropna(how="all").reset_index(drop=True)
+
+    # Remove rows that do not have any meaningful invoice identifiers or amounts/details.
+    key_cols = [c for c in [sp_col, bd_col, cs_col] if c]
+    if key_cols:
+        detail_df["_has_invoice_key"] = detail_df[key_cols].apply(
+            lambda row: any(str(v).strip() not in ("", "nan", "None") for v in row.tolist()),
+            axis=1
+        )
+    else:
+        detail_df["_has_invoice_key"] = False
+
+    value_cols = [c for c in [num_orders_col, num_invoiced_col, rem_orders_col, total_qty_col, total_amount_col] if c]
+    if value_cols:
+        detail_df["_has_value"] = detail_df[value_cols].notna().any(axis=1)
+    else:
+        detail_df["_has_value"] = True
+
+    detail_df = detail_df[(detail_df["_has_invoice_key"]) | (detail_df["_has_value"])].copy()
 
     def _norm_key_part(v):
         if pd.isna(v):
             return ""
-        return str(v).strip()
+        text = str(v).strip()
+        if text.lower() in {"nan", "none"}:
+            return ""
+        return text
 
-    if id_cols:
-        key_frame = work[id_cols].applymap(_norm_key_part)
+    if key_cols:
+        key_frame = detail_df[key_cols].applymap(_norm_key_part)
         non_blank_mask = key_frame.apply(lambda row: any(bool(v) for v in row), axis=1)
 
-        dedup_non_blank = work.loc[non_blank_mask].copy()
-        dedup_blank = work.loc[~non_blank_mask].copy()
+        dedup_non_blank = detail_df.loc[non_blank_mask].copy()
+        dedup_blank = detail_df.loc[~non_blank_mask].copy()
 
         if not dedup_non_blank.empty:
-            dedup_non_blank = dedup_non_blank.drop_duplicates(subset=id_cols, keep="first")
+            dedup_non_blank = dedup_non_blank.drop_duplicates(subset=key_cols, keep="first")
         if not dedup_blank.empty:
             dedup_blank = dedup_blank.drop_duplicates(keep="first")
 
         dedup = pd.concat([dedup_non_blank, dedup_blank], ignore_index=True)
     else:
-        dedup = work.drop_duplicates(keep="first").copy()
+        dedup = detail_df.drop_duplicates(keep="first").copy()
 
-    total_orders = float(dedup[num_orders_col].fillna(0).sum()) if num_orders_col else 0
-    total_invoiced = float(dedup[num_invoiced_col].fillna(0).sum()) if num_invoiced_col else 0
-    total_remaining = float(dedup[rem_orders_col].fillna(0).sum()) if rem_orders_col else 0
-    total_amount = float(dedup[total_amount_col].fillna(0).sum()) if total_amount_col else 0
+    # Main KPI rule:
+    # If the workbook contains one or more Grand Total rows, exclude those rows from KPI sums.
+    # Otherwise use the normal row sums. This does not change the uploaded workbook or exported file.
+    calc_df = work.loc[~grand_total_mask].copy() if has_grand_total else work.copy()
+
+    total_orders = float(calc_df[num_orders_col].fillna(0).sum()) if num_orders_col else 0
+    total_invoiced = float(calc_df[num_invoiced_col].fillna(0).sum()) if num_invoiced_col else 0
+    total_remaining = float(calc_df[rem_orders_col].fillna(0).sum()) if rem_orders_col else 0
+    total_amount = float(calc_df[total_amount_col].fillna(0).sum()) if total_amount_col else 0
 
     metrics_rows = [
         {"upload_id": upload_id, "metric_key": "number_of_orders", "metric_num": total_orders, "metric_text": None},
@@ -813,8 +854,9 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     ]
 
     status_rows = []
-    if status_col:
-        summary = dedup.groupby(status_col, dropna=False).size().reset_index(name="row_count")
+    if status_col and not dedup.empty:
+        status_summary_df = dedup[dedup[status_col].notna()].copy()
+        summary = status_summary_df.groupby(status_col, dropna=False).size().reset_index(name="row_count")
         for _, row in summary.iterrows():
             status_rows.append({
                 "upload_id": upload_id,
@@ -823,21 +865,9 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
             })
 
     team_rows = []
-    if team_col and rem_amt_col:
-        summary = (
-            dedup.groupby(team_col, dropna=False)[rem_amt_col]
-            .sum(min_count=1)
-            .reset_index(name="remaining_amount")
-        )
-        for _, row in summary.iterrows():
-            team_rows.append({
-                "upload_id": upload_id,
-                "team_value": trim_text(row[team_col], 100),
-                "remaining_amount": safe_num(row["remaining_amount"]),
-            })
 
     compact_rows = []
-    compact_df = dedup.head(MAX_INVOICE_DETAIL_ROWS)
+    compact_df = dedup.head(MAX_INVOICE_DETAIL_ROWS).copy()
     for _, row in compact_df.iterrows():
         compact_rows.append({
             "upload_id": upload_id,
@@ -1410,7 +1440,7 @@ def page_fbb_shipment_details():
 
 
 def page_fbb_invoice_status():
-    render_page_header("FBB Invoice Status", "Invoice progress, remaining quantity and team/status analysis.")
+    render_page_header("FBB Invoice Status", "Invoice progress and status analysis.")
 
     upload_meta = load_active_upload_meta("fbb_invoice_status")
     render_last_updated(upload_meta)
@@ -1440,12 +1470,6 @@ def page_fbb_invoice_status():
         fig = px.bar(status_df, x="status_value", y="row_count", hover_data=status_df.columns)
         st.plotly_chart(fig, use_container_width=True)
 
-    team_rows = load_table_records("invoice_team_summary", upload_id)
-    if team_rows:
-        team_df = pd.DataFrame(team_rows)[["team_value", "remaining_amount"]]
-        st.subheader("Remaining Amount by Team")
-        fig = px.bar(team_df, x="team_value", y="remaining_amount", hover_data=team_df.columns)
-        st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Invoice Detail Table")
     detail_rows = load_table_records("invoice_detail_compact", upload_id, limit_rows=MAX_INVOICE_DETAIL_ROWS)

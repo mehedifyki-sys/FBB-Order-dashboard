@@ -544,6 +544,105 @@ def load_workbook_sheets(storage_bucket: str | None, storage_path: str | None):
     return sheets
 
 
+def is_grand_total_text(value: Any) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    text = str(value).strip().lower().replace("_", " ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text)
+    return text == "grand total"
+
+
+def row_has_grand_total(row: pd.Series) -> bool:
+    return any(is_grand_total_text(v) for v in row.tolist())
+
+
+def clean_invoice_summary_sheet(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or not isinstance(df, pd.DataFrame):
+        return pd.DataFrame()
+
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+    out = out.dropna(how="all").reset_index(drop=True)
+
+    if out.empty:
+        return out
+
+    gt_mask = out.apply(row_has_grand_total, axis=1)
+    out = out.loc[~gt_mask].copy()
+    out = out.dropna(how="all").reset_index(drop=True)
+    return out
+
+
+def append_invoice_grand_total_row(df: pd.DataFrame) -> pd.DataFrame:
+    clean_df = clean_invoice_summary_sheet(df)
+    if clean_df.empty:
+        return clean_df
+
+    total_columns = [
+        "Number of Orders",
+        "Number of Invoiced Orders",
+        "Remaining Orders to Invoice",
+        "Total Qty Shipped",
+        "Total Amount",
+        "Invoiced Qty",
+        "Remaining Qty to invoice",
+        "Remaining Amount to invoice",
+        "#Days",
+    ]
+
+    grand_row = {col: None for col in clean_df.columns}
+    label_col = first_existing_column(clean_df, ["SP#", "BD Ref#", "CS Ref#"]) or clean_df.columns[0]
+    grand_row[label_col] = "Grand Total"
+
+    for col in total_columns:
+        if col in clean_df.columns:
+            total_val = pd.to_numeric(clean_df[col], errors="coerce").fillna(0).sum()
+            if pd.notna(total_val):
+                total_float = float(total_val)
+                grand_row[col] = int(round(total_float)) if abs(total_float - round(total_float)) < 1e-9 else total_float
+
+    return pd.concat([clean_df, pd.DataFrame([grand_row])], ignore_index=True)
+
+
+def excel_bytes_from_workbook_sheets(sheets: dict[str, pd.DataFrame]) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl", datetime_format="YYYY-MM-DD") as writer:
+        for idx, (sheet_name, sheet_df) in enumerate(sheets.items()):
+            write_name = (sheet_name[:31] if sheet_name else f"Sheet{idx + 1}")
+            clean_df = clean_export_dataframe(sheet_df.copy())
+            clean_df.to_excel(writer, index=False, sheet_name=write_name)
+    output.seek(0)
+    return output.getvalue()
+
+
+def build_invoice_status_export_bytes(upload_meta: dict) -> bytes:
+    storage_bucket = upload_meta.get("storage_bucket")
+    storage_path = upload_meta.get("storage_path")
+
+    if not storage_bucket or not storage_path:
+        upload_id = int(upload_meta["id"])
+        column_order = tuple(upload_meta.get("column_order", []) or [])
+        sheet_name = upload_meta.get("sheet_name", "FBB Summary")
+        export_df = load_export_df(upload_id, column_order, None, None)
+        export_df = append_invoice_grand_total_row(export_df)
+        return excel_bytes_from_df(export_df, sheet_name)
+
+    original_sheets = load_workbook_sheets(storage_bucket, storage_path)
+    if not original_sheets:
+        return download_export_bytes(storage_bucket, storage_path)
+
+    rebuilt_sheets = {}
+    first_sheet_done = False
+    for sheet_name, sheet_df in original_sheets.items():
+        if not first_sheet_done:
+            rebuilt_sheets[sheet_name] = append_invoice_grand_total_row(sheet_df)
+            first_sheet_done = True
+        else:
+            rebuilt_sheets[sheet_name] = sheet_df.copy()
+
+    return excel_bytes_from_workbook_sheets(rebuilt_sheets)
+
+
 def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl", datetime_format="YYYY-MM-DD") as writer:
@@ -551,10 +650,6 @@ def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
     output.seek(0)
     return output.getvalue()
 
-
-# =========================================================
-# BUILD DATA
-# =========================================================
 def build_order_dashboard_data(df: pd.DataFrame, upload_id: int):
     order_col = first_existing_column(df, ["BC Order", "SalesDocument"])
     material_col = first_existing_column(df, ["MaterialNumber"])
@@ -769,7 +864,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     bd_col = first_existing_column(df, ["BD Ref#"])
     cs_col = first_existing_column(df, ["CS Ref#"])
 
-    work = df.copy()
+    work = clean_invoice_summary_sheet(df)
 
     numeric_cols = [
         num_orders_col, num_invoiced_col, rem_orders_col, total_qty_col,
@@ -778,73 +873,10 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     for c in [x for x in numeric_cols if x]:
         work[c] = parse_numeric_series(work[c])
 
-    def _row_text(row: pd.Series) -> str:
-        parts = []
-        for v in row.tolist():
-            if pd.isna(v):
-                continue
-            parts.append(str(v).strip().lower())
-        return " | ".join(parts)
-
-    # Detect workbook-provided grand total row and use it directly.
-    grand_total_mask = work.apply(lambda row: "grand-total" in _row_text(row) or "grand total" in _row_text(row), axis=1)
-    has_grand_total = bool(grand_total_mask.any())
-
-    # Remove blank separator rows and grand-total rows from detail-level processing.
-    detail_df = work.loc[~grand_total_mask].copy()
-    detail_df = detail_df.dropna(how="all").reset_index(drop=True)
-
-    # Remove rows that do not have any meaningful invoice identifiers or amounts/details.
-    key_cols = [c for c in [sp_col, bd_col, cs_col] if c]
-    if key_cols:
-        detail_df["_has_invoice_key"] = detail_df[key_cols].apply(
-            lambda row: any(str(v).strip() not in ("", "nan", "None") for v in row.tolist()),
-            axis=1
-        )
-    else:
-        detail_df["_has_invoice_key"] = False
-
-    value_cols = [c for c in [num_orders_col, num_invoiced_col, rem_orders_col, total_qty_col, total_amount_col] if c]
-    if value_cols:
-        detail_df["_has_value"] = detail_df[value_cols].notna().any(axis=1)
-    else:
-        detail_df["_has_value"] = True
-
-    detail_df = detail_df[(detail_df["_has_invoice_key"]) | (detail_df["_has_value"])].copy()
-
-    def _norm_key_part(v):
-        if pd.isna(v):
-            return ""
-        text = str(v).strip()
-        if text.lower() in {"nan", "none"}:
-            return ""
-        return text
-
-    if key_cols:
-        key_frame = detail_df[key_cols].applymap(_norm_key_part)
-        non_blank_mask = key_frame.apply(lambda row: any(bool(v) for v in row), axis=1)
-
-        dedup_non_blank = detail_df.loc[non_blank_mask].copy()
-        dedup_blank = detail_df.loc[~non_blank_mask].copy()
-
-        if not dedup_non_blank.empty:
-            dedup_non_blank = dedup_non_blank.drop_duplicates(subset=key_cols, keep="first")
-        if not dedup_blank.empty:
-            dedup_blank = dedup_blank.drop_duplicates(keep="first")
-
-        dedup = pd.concat([dedup_non_blank, dedup_blank], ignore_index=True)
-    else:
-        dedup = detail_df.drop_duplicates(keep="first").copy()
-
-    # Main KPI rule:
-    # If the workbook contains one or more Grand Total rows, exclude those rows from KPI sums.
-    # Otherwise use the normal row sums. This does not change the uploaded workbook or exported file.
-    calc_df = work.loc[~grand_total_mask].copy() if has_grand_total else work.copy()
-
-    total_orders = float(calc_df[num_orders_col].fillna(0).sum()) if num_orders_col else 0
-    total_invoiced = float(calc_df[num_invoiced_col].fillna(0).sum()) if num_invoiced_col else 0
-    total_remaining = float(calc_df[rem_orders_col].fillna(0).sum()) if rem_orders_col else 0
-    total_amount = float(calc_df[total_amount_col].fillna(0).sum()) if total_amount_col else 0
+    total_orders = float(work[num_orders_col].fillna(0).sum()) if num_orders_col else 0
+    total_invoiced = float(work[num_invoiced_col].fillna(0).sum()) if num_invoiced_col else 0
+    total_remaining = float(work[rem_orders_col].fillna(0).sum()) if rem_orders_col else 0
+    total_amount = float(work[total_amount_col].fillna(0).sum()) if total_amount_col else 0
 
     metrics_rows = [
         {"upload_id": upload_id, "metric_key": "number_of_orders", "metric_num": total_orders, "metric_text": None},
@@ -854,8 +886,8 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     ]
 
     status_rows = []
-    if status_col and not dedup.empty:
-        status_summary_df = dedup[dedup[status_col].notna()].copy()
+    if status_col and not work.empty:
+        status_summary_df = work[work[status_col].notna()].copy()
         summary = status_summary_df.groupby(status_col, dropna=False).size().reset_index(name="row_count")
         for _, row in summary.iterrows():
             status_rows.append({
@@ -867,13 +899,13 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     team_rows = []
 
     compact_rows = []
-    compact_df = dedup.head(MAX_INVOICE_DETAIL_ROWS).copy()
+    compact_df = work.head(MAX_INVOICE_DETAIL_ROWS)
     for _, row in compact_df.iterrows():
         compact_rows.append({
             "upload_id": upload_id,
-            "sp_no": trim_text(row[sp_col], 100) if sp_col and sp_col in row.index else None,
-            "bd_ref": trim_text(row[bd_col], 100) if bd_col and bd_col in row.index else None,
-            "cs_ref": trim_text(row[cs_col], 100) if cs_col and cs_col in row.index else None,
+            "sp_no": trim_text(row[sp_col], 100) if sp_col else None,
+            "bd_ref": trim_text(row[bd_col], 100) if bd_col else None,
+            "cs_ref": trim_text(row[cs_col], 100) if cs_col else None,
             "number_of_orders": safe_num(row[num_orders_col]) if num_orders_col else None,
             "number_of_invoiced_orders": safe_num(row[num_invoiced_col]) if num_invoiced_col else None,
             "remaining_orders_to_invoice": safe_num(row[rem_orders_col]) if rem_orders_col else None,
@@ -892,10 +924,6 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     return metrics_rows, status_rows, team_rows, compact_rows
 
 
-# =========================================================
-# UPLOAD
-# =========================================================
-
 def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     progress = st.progress(0, text="Reading file...")
 
@@ -913,6 +941,9 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         primary_df = pd.read_excel(excel, sheet_name=primary_sheet_name, dtype=object)
         primary_df.columns = [str(c).strip() for c in primary_df.columns]
         primary_df = primary_df.dropna(how="all").reset_index(drop=True)
+
+        if dataset_key == "fbb_invoice_status":
+            primary_df = clean_invoice_summary_sheet(primary_df)
 
         if primary_df.empty:
             progress.empty()
@@ -1176,7 +1207,9 @@ def render_export_section(dataset_key: str, upload_meta: dict | None):
     with dl_col:
         if st.session_state.export_ready_for == dataset_key:
             with st.spinner("Preparing export..."):
-                if storage_bucket and storage_path:
+                if dataset_key == "fbb_invoice_status":
+                    export_bytes = build_invoice_status_export_bytes(upload_meta)
+                elif storage_bucket and storage_path:
                     export_bytes = download_export_bytes(storage_bucket, storage_path)
                 else:
                     upload_id = int(upload_meta["id"])

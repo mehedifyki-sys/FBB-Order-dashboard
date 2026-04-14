@@ -777,25 +777,28 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     for c in [x for x in numeric_cols if x]:
         work[c] = parse_numeric_series(work[c])
 
-    key_cols = [c for c in [sp_col, bd_col, cs_col] if c]
-    if key_cols:
-        key_frame = work[key_cols].fillna("").astype(str).apply(lambda s: s.str.strip())
-        joined_key = key_frame.apply(lambda row: "||".join([v for v in row if v]), axis=1)
-        work["_invoice_key"] = joined_key.where(joined_key.ne(""), work.index.astype(str))
-    else:
-        work["_invoice_key"] = work.index.astype(str)
+    id_cols = [c for c in [sp_col, bd_col, cs_col] if c]
 
-    agg_map = {}
-    for c in [x for x in numeric_cols if x]:
-        agg_map[c] = "max"
-    for c in [status_col, team_col, handover_col, pickup_col]:
-        if c:
-            agg_map[c] = "first"
+    def _norm_key_part(v):
+        if pd.isna(v):
+            return ""
+        return str(v).strip()
 
-    if agg_map:
-        dedup = work.groupby("_invoice_key", dropna=False).agg(agg_map).reset_index()
+    if id_cols:
+        key_frame = work[id_cols].applymap(_norm_key_part)
+        non_blank_mask = key_frame.apply(lambda row: any(bool(v) for v in row), axis=1)
+
+        dedup_non_blank = work.loc[non_blank_mask].copy()
+        dedup_blank = work.loc[~non_blank_mask].copy()
+
+        if not dedup_non_blank.empty:
+            dedup_non_blank = dedup_non_blank.drop_duplicates(subset=id_cols, keep="first")
+        if not dedup_blank.empty:
+            dedup_blank = dedup_blank.drop_duplicates(keep="first")
+
+        dedup = pd.concat([dedup_non_blank, dedup_blank], ignore_index=True)
     else:
-        dedup = work.copy()
+        dedup = work.drop_duplicates(keep="first").copy()
 
     total_orders = float(dedup[num_orders_col].fillna(0).sum()) if num_orders_col else 0
     total_invoiced = float(dedup[num_invoiced_col].fillna(0).sum()) if num_invoiced_col else 0
@@ -1428,7 +1431,7 @@ def page_fbb_invoice_status():
     c1.metric("Number of Orders", f"{int(metrics.get('number_of_orders', 0)):,}")
     c2.metric("Invoiced Orders", f"{int(metrics.get('invoiced_orders', 0)):,}")
     c3.metric("Remaining Orders", f"{int(metrics.get('remaining_orders', 0)):,}")
-    c4.metric("Total Amount", f"{float(metrics.get('total_amount', 0)):,.2f}")
+    c4.metric("Total Amount", f"{float(metrics.get('total_amount', 0)):,.0f}")
 
     status_rows = load_table_records("invoice_status_summary", upload_id)
     if status_rows:

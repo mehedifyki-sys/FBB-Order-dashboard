@@ -634,24 +634,22 @@ def build_invoice_status_export_bytes(upload_meta: dict) -> bytes:
     if not wb.worksheets:
         return original_bytes
 
+    # Read the first sheet through pandas so totals are based on cleaned data rows only.
+    source_df = pd.read_excel(io.BytesIO(original_bytes), sheet_name=0, dtype=object)
+    source_df.columns = [str(c).strip() for c in source_df.columns]
+    clean_df = clean_invoice_summary_sheet(source_df)
+
     ws = wb.worksheets[0]
     header_row = 1
-    data_start_row = 2
 
     grand_total_row = find_grand_total_excel_row(ws)
     if grand_total_row:
-        data_end_row = grand_total_row - 1
         target_total_row = grand_total_row
     else:
-        last_nonempty_row = find_last_nonempty_excel_row(ws)
-        data_end_row = last_nonempty_row
-        target_total_row = last_nonempty_row + 1
+        target_total_row = find_last_nonempty_excel_row(ws) + 1
         ws.insert_rows(target_total_row, 1)
 
-    if data_end_row < data_start_row:
-        data_end_row = data_start_row - 1
-
-    style_source_row = grand_total_row or max(data_end_row, header_row)
+    style_source_row = grand_total_row or max(target_total_row - 1, header_row)
     copy_excel_row_style(ws, style_source_row, target_total_row)
 
     headers = {}
@@ -681,14 +679,26 @@ def build_invoice_status_export_bytes(upload_meta: dict) -> bytes:
 
     for column_name in total_columns:
         col_idx = headers.get(column_name)
-        if not col_idx:
+        if not col_idx or column_name not in clean_df.columns:
             continue
 
-        col_letter = ws.cell(row=header_row, column=col_idx).column_letter
-        if data_end_row >= data_start_row:
-            ws.cell(row=target_total_row, column=col_idx).value = f"=SUM({col_letter}{data_start_row}:{col_letter}{data_end_row})"
-        else:
-            ws.cell(row=target_total_row, column=col_idx).value = 0
+        col_series = pd.to_numeric(clean_df[column_name], errors="coerce")
+        total_value = float(col_series.fillna(0).sum())
+        if pd.isna(total_value):
+            total_value = 0
+
+        if abs(total_value - round(total_value)) < 1e-9:
+            total_value = int(round(total_value))
+
+        ws.cell(row=target_total_row, column=col_idx).value = total_value
+
+    # Make sure Excel opens with calculations enabled for any other workbook formulas.
+    try:
+        wb.calculation.calcMode = "auto"
+        wb.calculation.fullCalcOnLoad = True
+        wb.calculation.forceFullCalc = True
+    except Exception:
+        pass
 
     output = io.BytesIO()
     wb.save(output)

@@ -470,11 +470,13 @@ def load_table_records(table_name: str, upload_id: int, limit_rows: int | None =
 
 
 @st.cache_data(ttl=60)
+
+@st.cache_data(ttl=60)
 def load_export_df(upload_id: int, column_order: tuple, storage_bucket: str | None = None, storage_path: str | None = None):
     if storage_bucket and storage_path:
         file_bytes = download_export_bytes(storage_bucket, storage_path)
         bio = io.BytesIO(file_bytes)
-        export_df = pd.read_excel(bio, dtype=object)
+        export_df = pd.read_excel(bio, sheet_name=0, dtype=object)
         export_df.columns = [str(c).strip() for c in export_df.columns]
         ordered_cols = [c for c in column_order if c in export_df.columns]
         extra_cols = [c for c in export_df.columns if c not in ordered_cols]
@@ -521,6 +523,25 @@ def load_export_df(upload_id: int, column_order: tuple, storage_bucket: str | No
         df = pd.DataFrame(columns=list(column_order))
 
     return clean_export_dataframe(df)
+
+
+@st.cache_data(ttl=60)
+def load_workbook_sheets(storage_bucket: str | None, storage_path: str | None):
+    if not storage_bucket or not storage_path:
+        return {}
+
+    file_bytes = download_export_bytes(storage_bucket, storage_path)
+    bio = io.BytesIO(file_bytes)
+    excel = pd.ExcelFile(bio)
+    sheets = {}
+
+    for sheet_name in excel.sheet_names:
+        sheet_df = pd.read_excel(excel, sheet_name=sheet_name, dtype=object)
+        sheet_df.columns = [str(c).strip() for c in sheet_df.columns]
+        sheet_df = clean_export_dataframe(sheet_df.dropna(how="all").reset_index(drop=True))
+        sheets[sheet_name] = sheet_df
+
+    return sheets
 
 
 def excel_bytes_from_df(df: pd.DataFrame, sheet_name: str):
@@ -728,6 +749,7 @@ def build_shipment_data(df: pd.DataFrame, upload_id: int):
     return metrics_rows, month_rows, ref_summary_rows
 
 
+
 def build_invoice_data(df: pd.DataFrame, upload_id: int):
     num_orders_col = first_existing_column(df, ["Number of Orders"])
     num_invoiced_col = first_existing_column(df, ["Number of Invoiced Orders"])
@@ -763,19 +785,22 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     else:
         work["_invoice_key"] = work.index.astype(str)
 
-    total_orders = float(work[num_orders_col].sum()) if num_orders_col else 0
-    total_invoiced = float(work[num_invoiced_col].sum()) if num_invoiced_col else 0
-    total_remaining = float(work[rem_orders_col].sum()) if rem_orders_col else 0
+    agg_map = {}
+    for c in [x for x in numeric_cols if x]:
+        agg_map[c] = "max"
+    for c in [status_col, team_col, handover_col, pickup_col]:
+        if c:
+            agg_map[c] = "first"
 
-    if total_amount_col:
-        total_amount = float(
-            work.groupby("_invoice_key", dropna=False)[total_amount_col]
-            .max()
-            .fillna(0)
-            .sum()
-        )
+    if agg_map:
+        dedup = work.groupby("_invoice_key", dropna=False).agg(agg_map).reset_index()
     else:
-        total_amount = 0
+        dedup = work.copy()
+
+    total_orders = float(dedup[num_orders_col].fillna(0).sum()) if num_orders_col else 0
+    total_invoiced = float(dedup[num_invoiced_col].fillna(0).sum()) if num_invoiced_col else 0
+    total_remaining = float(dedup[rem_orders_col].fillna(0).sum()) if rem_orders_col else 0
+    total_amount = float(dedup[total_amount_col].fillna(0).sum()) if total_amount_col else 0
 
     metrics_rows = [
         {"upload_id": upload_id, "metric_key": "number_of_orders", "metric_num": total_orders, "metric_text": None},
@@ -786,7 +811,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
 
     status_rows = []
     if status_col:
-        summary = work.groupby(status_col, dropna=False).size().reset_index(name="row_count")
+        summary = dedup.groupby(status_col, dropna=False).size().reset_index(name="row_count")
         for _, row in summary.iterrows():
             status_rows.append({
                 "upload_id": upload_id,
@@ -797,7 +822,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
     team_rows = []
     if team_col and rem_amt_col:
         summary = (
-            work.groupby(team_col, dropna=False)[rem_amt_col]
+            dedup.groupby(team_col, dropna=False)[rem_amt_col]
             .sum(min_count=1)
             .reset_index(name="remaining_amount")
         )
@@ -809,13 +834,13 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
             })
 
     compact_rows = []
-    compact_df = work.head(MAX_INVOICE_DETAIL_ROWS)
+    compact_df = dedup.head(MAX_INVOICE_DETAIL_ROWS)
     for _, row in compact_df.iterrows():
         compact_rows.append({
             "upload_id": upload_id,
-            "sp_no": trim_text(row[sp_col], 100) if sp_col else None,
-            "bd_ref": trim_text(row[bd_col], 100) if bd_col else None,
-            "cs_ref": trim_text(row[cs_col], 100) if cs_col else None,
+            "sp_no": trim_text(row[sp_col], 100) if sp_col and sp_col in row.index else None,
+            "bd_ref": trim_text(row[bd_col], 100) if bd_col and bd_col in row.index else None,
+            "cs_ref": trim_text(row[cs_col], 100) if cs_col and cs_col in row.index else None,
             "number_of_orders": safe_num(row[num_orders_col]) if num_orders_col else None,
             "number_of_invoiced_orders": safe_num(row[num_invoiced_col]) if num_invoiced_col else None,
             "remaining_orders_to_invoice": safe_num(row[rem_orders_col]) if rem_orders_col else None,
@@ -837,6 +862,7 @@ def build_invoice_data(df: pd.DataFrame, upload_id: int):
 # =========================================================
 # UPLOAD
 # =========================================================
+
 def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
     progress = st.progress(0, text="Reading file...")
 
@@ -845,23 +871,27 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         file_bytes = uploaded_file.read()
         bio = io.BytesIO(file_bytes)
         excel = pd.ExcelFile(bio)
-        sheet_name = excel.sheet_names[0]
-        bio.seek(0)
-        df = pd.read_excel(bio, sheet_name=sheet_name, dtype=object)
+        sheet_names = excel.sheet_names
+        if not sheet_names:
+            progress.empty()
+            return False, "Uploaded workbook has no sheets."
+
+        primary_sheet_name = sheet_names[0]
+        primary_df = pd.read_excel(excel, sheet_name=primary_sheet_name, dtype=object)
+        primary_df.columns = [str(c).strip() for c in primary_df.columns]
+        primary_df = primary_df.dropna(how="all").reset_index(drop=True)
+
+        if primary_df.empty:
+            progress.empty()
+            return False, "Uploaded primary sheet is empty after removing blank rows."
+
     except Exception as e:
         progress.empty()
         return False, f"Could not read Excel file: {e}"
 
-    df.columns = [str(c).strip() for c in df.columns]
-    df = df.dropna(how="all").reset_index(drop=True)
-
-    if df.empty:
-        progress.empty()
-        return False, "Uploaded file is empty after removing blank rows."
-
-    if len(df) >= 120000:
+    if len(primary_df) >= 120000:
         st.warning(
-            f"Large upload detected: {len(df):,} rows. "
+            f"Large upload detected: {len(primary_df):,} rows. "
             "Upload time is reduced because the original file is stored directly in Supabase Storage instead of chunking every row into the database."
         )
 
@@ -888,9 +918,9 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
             "dataset_key": dataset_key,
             "original_filename": uploaded_file.name,
             "uploaded_by": admin_name,
-            "row_count": int(len(df)),
-            "column_order": list(df.columns),
-            "sheet_name": sheet_name,
+            "row_count": int(len(primary_df)),
+            "column_order": list(primary_df.columns),
+            "sheet_name": primary_sheet_name,
             "is_active": True,
             "storage_bucket": STORAGE_BUCKET,
             "storage_path": storage_path,
@@ -905,7 +935,7 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
 
         if dataset_key == "order_dashboard":
             progress.progress(42, text="Building order dashboard...")
-            metrics_rows, weekly_rows, open_rows, duplicate_rows = build_order_dashboard_data(df, upload_id)
+            metrics_rows, weekly_rows, open_rows, duplicate_rows = build_order_dashboard_data(primary_df, upload_id)
             insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
             insert_in_chunks("order_weekly_summary", weekly_rows, DB_INSERT_CHUNK)
             insert_in_chunks("order_open_orders", open_rows, DB_INSERT_CHUNK)
@@ -913,14 +943,14 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
 
         elif dataset_key == "fbb_shipment_details":
             progress.progress(42, text="Building shipment dashboard...")
-            metrics_rows, month_rows, ref_summary_rows = build_shipment_data(df, upload_id)
+            metrics_rows, month_rows, ref_summary_rows = build_shipment_data(primary_df, upload_id)
             insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
             insert_in_chunks("shipment_month_summary", month_rows, DB_INSERT_CHUNK)
             insert_in_chunks("shipment_ref_summary", ref_summary_rows, DB_INSERT_CHUNK)
 
         elif dataset_key == "fbb_invoice_status":
             progress.progress(42, text="Building invoice dashboard...")
-            metrics_rows, status_rows, team_rows, compact_rows = build_invoice_data(df, upload_id)
+            metrics_rows, status_rows, team_rows, compact_rows = build_invoice_data(primary_df, upload_id)
             insert_in_chunks("dataset_metrics", metrics_rows, DB_INSERT_CHUNK)
             insert_in_chunks("invoice_status_summary", status_rows, DB_INSERT_CHUNK)
             insert_in_chunks("invoice_team_summary", team_rows, DB_INSERT_CHUNK)
@@ -948,7 +978,7 @@ def upload_dataset(dataset_key: str, uploaded_file, admin_name: str):
         progress.progress(100, text="Upload complete.")
         progress.empty()
 
-        return True, f"{DATASETS[dataset_key]['label']} uploaded successfully. Rows: {len(df):,}"
+        return True, f"{DATASETS[dataset_key]['label']} uploaded successfully. Main sheet: {primary_sheet_name}. Total sheets preserved: {len(sheet_names)}"
 
     except Exception as e:
         progress.empty()
@@ -1092,6 +1122,7 @@ def render_admin_upload_section(dataset_key: str):
                     st.error(msg)
 
 
+
 def render_export_section(dataset_key: str, upload_meta: dict | None):
     st.subheader("Export")
 
@@ -1099,10 +1130,9 @@ def render_export_section(dataset_key: str, upload_meta: dict | None):
         st.warning("No data available for export.")
         return
 
-    upload_id = int(upload_meta["id"])
     original_filename = upload_meta.get("original_filename", DATASETS[dataset_key]["download_name"])
-    sheet_name = upload_meta.get("sheet_name", DATASETS[dataset_key]["label"])
-    column_order = tuple(upload_meta.get("column_order", []) or [])
+    storage_bucket = upload_meta.get("storage_bucket")
+    storage_path = upload_meta.get("storage_path")
 
     prep_col, dl_col = st.columns([1, 2])
 
@@ -1113,8 +1143,14 @@ def render_export_section(dataset_key: str, upload_meta: dict | None):
     with dl_col:
         if st.session_state.export_ready_for == dataset_key:
             with st.spinner("Preparing export..."):
-                export_df = load_export_df(upload_id, column_order, upload_meta.get("storage_bucket"), upload_meta.get("storage_path"))
-                export_bytes = excel_bytes_from_df(export_df, sheet_name)
+                if storage_bucket and storage_path:
+                    export_bytes = download_export_bytes(storage_bucket, storage_path)
+                else:
+                    upload_id = int(upload_meta["id"])
+                    sheet_name = upload_meta.get("sheet_name", DATASETS[dataset_key]["label"])
+                    column_order = tuple(upload_meta.get("column_order", []) or [])
+                    export_df = load_export_df(upload_id, column_order, None, None)
+                    export_bytes = excel_bytes_from_df(export_df, sheet_name)
 
             st.download_button(
                 label="⬇️ Download current dataset",
@@ -1369,6 +1405,7 @@ def page_fbb_shipment_details():
         st.info("No BD shipment references found.")
 
 
+
 def page_fbb_invoice_status():
     render_page_header("FBB Invoice Status", "Invoice progress, remaining quantity and team/status analysis.")
 
@@ -1422,6 +1459,28 @@ def page_fbb_invoice_status():
         st.dataframe(detail_df, use_container_width=True, height=420)
     else:
         st.info("No invoice rows found.")
+
+    workbook_sheets = load_workbook_sheets(upload_meta.get("storage_bucket"), upload_meta.get("storage_path"))
+    extra_sheet_names = list(workbook_sheets.keys())[1:]
+
+    if extra_sheet_names:
+        st.divider()
+        st.subheader("Additional Sheet Data")
+
+        selected_sheet = st.selectbox(
+            "Select uploaded sheet",
+            options=extra_sheet_names,
+            key="invoice_extra_sheet_select"
+        )
+
+        extra_df = workbook_sheets.get(selected_sheet, pd.DataFrame()).copy()
+        if not extra_df.empty:
+            extra_search = st.text_input(f"Search {selected_sheet}", key=f"search_{selected_sheet}")
+            extra_df = search_dataframe(extra_df, extra_search)
+            st.caption(f"Showing uploaded data from sheet: {selected_sheet}")
+            st.dataframe(extra_df, use_container_width=True, height=360)
+        else:
+            st.info("Selected extra sheet has no rows.")
 
 
 # =========================================================
